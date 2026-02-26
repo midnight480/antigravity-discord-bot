@@ -2000,6 +2000,28 @@ async function getLastResponse(cdp) {
             let foundLatestUser = false;
             let domDebug = { loops: 0, blocksFiltered: 0, extractedLength: 0 };
 
+            // 背景色からユーザーの吹き出しを特定するヘルパー
+            function findUserBubbleByComputedStyle(startEl, fallbackSelector) {
+                if (!startEl) return null;
+                const container = document.querySelector('.relative.flex.flex-col.gap-y-3.px-4') || document.body;
+                let bgStyle = '';
+                try {
+                    bgStyle = window.getComputedStyle(container).backgroundColor;
+                } catch (e) {}
+                let current = startEl;
+                while (current && current !== document.body && current !== container) {
+                    try {
+                        const s = window.getComputedStyle(current);
+                        const c = s.backgroundColor;
+                        if (c && c !== 'rgba(0, 0, 0, 0)' && c !== 'transparent' && c !== bgStyle) {
+                            return current;
+                        }
+                    } catch (e) {}
+                    current = current.parentElement;
+                }
+                return startEl.closest(fallbackSelector) || startEl.parentElement;
+            }
+
             const scrollContainer = document.querySelector('.h-full.overflow-y-auto');
             if (scrollContainer) scrollContainer.scrollTop = 999999;
             await new Promise(r => setTimeout(r, 500));
@@ -2022,9 +2044,12 @@ async function getLastResponse(cdp) {
                     // --- 1. User送信テキストの抽出 ---
                     const undoEl = block.querySelector('[data-tooltip-id*="undo"]') || block.querySelector('[title*="Undo"]');
                     if (undoEl) {
-                    let userBubble = undoEl.closest('.bg-gray-500\\\\/15') || undoEl.closest('.whitespace-pre-wrap') || undoEl.parentElement;
+                        let userBubble = findUserBubbleByComputedStyle(undoEl, '.whitespace-pre-wrap');
                         while (userBubble && userBubble.parentElement && userBubble.innerText.length < 10 && userBubble.parentElement !== block) {
                             userBubble = userBubble.parentElement;
+                        }
+                        if (userBubble) {
+                            userBubble.setAttribute('data-ag-user-bubble', 'true');
                         }
                         userText = userBubble ? userBubble.innerText.trim() : undoEl.parentElement.innerText.trim();
                     }
@@ -2034,6 +2059,14 @@ async function getLastResponse(cdp) {
                     // --- 2. ノイズ要素を除外したDOMのクローンを作成 ---
                     const clone = block.cloneNode(true);
 
+                    // クローン後に元のDOMに付けたマーカーは削除する
+                    if (undoEl) {
+                        const originalUserBubbles = block.querySelectorAll('[data-ag-user-bubble="true"]');
+                        for (let i = 0; i < originalUserBubbles.length; i++) {
+                            originalUserBubbles[i].removeAttribute('data-ag-user-bubble');
+                        }
+                    }
+
                     function replaceWithNewlines(container) {
                         if (!container || !container.parentNode) return;
                         const marker = document.createTextNode('\\n\\n');
@@ -2041,7 +2074,7 @@ async function getLastResponse(cdp) {
                     }
 
                     Array.from(clone.querySelectorAll('[data-tooltip-id*="undo"], [title*="Undo"]')).forEach(cu => {
-                        let cuBubble = cu.closest('.bg-gray-500\\\\/15') || cu.closest('.whitespace-pre-wrap') || cu.parentElement;
+                        let cuBubble = cu.closest('[data-ag-user-bubble="true"]') || cu.closest('.whitespace-pre-wrap') || cu.parentElement;
                         if (cuBubble && cuBubble.parentNode) replaceWithNewlines(cuBubble);
                     });
 
