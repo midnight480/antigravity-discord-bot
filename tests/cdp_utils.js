@@ -1,7 +1,7 @@
 import WebSocket from 'ws';
 import http from 'http';
 
-const PORTS = [9222, 9000, 9001, 9002, 9003];
+const PORTS = [9222];
 const CDP_CALL_TIMEOUT = 30000;
 
 let cdpConnection = null;

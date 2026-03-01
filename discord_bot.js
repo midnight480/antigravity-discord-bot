@@ -11,7 +11,7 @@ import fs from 'fs';
 import path from 'path';
 
 // --- CONFIGURATION ---
-const PORTS = [9222, 9000, 9001, 9002, 9003];
+const PORTS = [9222];
 const CDP_CALL_TIMEOUT = 30000;
 const POLLING_INTERVAL = 2000;
 const RAW_CLI_ARGS = process.argv.slice(2).map(arg => String(arg || ''));
@@ -62,6 +62,18 @@ let autoApproveMode = false;
 const LOG_FILE = 'discord_interaction.log';
 const ALLOWED_DISCORD_USER = (process.env.DISCORD_ALLOWED_USER_ID || '').trim();
 const ALLOWED_DISCORD_USER_IS_ID = /^\d+$/.test(ALLOWED_DISCORD_USER);
+
+// セキュリティガード: DISCORD_ALLOWED_USER_ID が未設定の場合は起動を拒否する
+if (!ALLOWED_DISCORD_USER) {
+    console.error('\x1b[31m[SECURITY ERROR] DISCORD_ALLOWED_USER_ID is not set in .env file.\x1b[0m');
+    console.error('Please set your Discord user ID in the .env file:');
+    console.error('  DISCORD_ALLOWED_USER_ID=your_user_id_here');
+    console.error('');
+    console.error('To get your Discord user ID:');
+    console.error('  1. Open Discord Settings > Advanced > Enable Developer Mode');
+    console.error('  2. Right-click your username > Copy User ID');
+    process.exit(1);
+}
 const DISCORD_ACTIVITY_LOG_ENABLED = !['0', 'false', 'off'].includes((process.env.DISCORD_ACTIVITY_LOG || 'false').toLowerCase());
 const DISCORD_ACTIVITY_LOG_TYPES = new Set([
     'APPROVAL',
@@ -70,7 +82,7 @@ const DISCORD_ACTIVITY_LOG_TYPES = new Set([
 ]);
 
 function isAuthorizedDiscordUser(user) {
-    if (!ALLOWED_DISCORD_USER) return true;
+    // 注: ALLOWED_DISCORD_USER が空の場合は起動時にガードされるため、ここには到達しない
 
     if (ALLOWED_DISCORD_USER_IS_ID) {
         return user.id === ALLOWED_DISCORD_USER;
@@ -846,68 +858,19 @@ async function safeReplyTarget(target, payload, options = {}) {
 async function sendResponseEmbeds(originalMessage, response, promptText = '') {
     if (!response?.text) return false;
 
-    const structuredFromText = extractStructuredAssistantContent(response.text, promptText);
-    const structuredFromMarkdown = response.markdown
-        ? extractStructuredAssistantContent(response.markdown, promptText)
-        : null;
-    const structured = structuredContentScore(structuredFromMarkdown) > structuredContentScore(structuredFromText)
-        ? structuredFromMarkdown
-        : structuredFromText;
-
-    const autoPrompt = String(promptText || '').trim()
-        || String(response?.prompt || '').trim()
-        || detectPromptFromRawText(response.text || '')
-        || detectPromptFromRawText(response.markdown || '');
-
-    const cleanedMarkdown = sanitizeAssistantMarkdown(response.markdown || '', autoPrompt);
-    const cleanedText = structured.bodyText || sanitizeAssistantResponse(response.text, autoPrompt);
-    const narrativeMarkdown = extractFinalAssistantSummary(selectFinalNarrativeSegment(extractNarrativeBody(cleanedMarkdown)));
-    const narrativeText = extractFinalAssistantSummary(selectFinalNarrativeSegment(extractNarrativeBody(cleanedText)));
-    const markdownScore = meaningfulBodyScore(cleanedMarkdown);
-    const textScore = meaningfulBodyScore(cleanedText);
-    const narrativeMarkdownScore = meaningfulBodyScore(narrativeMarkdown);
-    const narrativeTextScore = meaningfulBodyScore(narrativeText);
-
-    let cleaned = '';
-    if (narrativeMarkdownScore > 0 || narrativeTextScore > 0) {
-        cleaned = narrativeMarkdownScore >= narrativeTextScore ? narrativeMarkdown : narrativeText;
-    } else {
-        cleaned = extractFinalAssistantSummary((markdownScore >= textScore ? cleanedMarkdown : cleanedText) || cleanedMarkdown || cleanedText);
-    }
-    if (!cleaned) {
-        cleaned = extractFinalAssistantSummary(response.markdown || response.text || '');
-    }
-    cleaned = cleanupNoiseLines(cleaned);
-    const changeSection = buildChangeSection(structured);
-    const content = changeSection
-        ? (cleaned ? `${changeSection}\n\n### Assistant Message\n${cleaned}` : changeSection)
-        : (cleaned || String(response.markdown || response.text || '').trim());
+    // getLastResponse で既に除外・文字数制限済みのテキストをそのまま送信
+    const content = response.text;
     if (!content) return false;
 
-    const preview = content
-        .replace(/\r/g, '')
-        .split('\n')
-        .slice(0, 18)
-        .join('\n')
-        .slice(0, 1200);
-    logInteraction(
-        'ACTION',
-        `[SEND_PREVIEW] markdownScore=${markdownScore}, textScore=${textScore}, narrativeMarkdownScore=${narrativeMarkdownScore}, narrativeTextScore=${narrativeTextScore}, prompt="${autoPrompt.slice(0, 140)}"\n${preview}`
-    );
-
-    await emitRawDump(originalMessage, response, autoPrompt, content);
+    logInteraction('ACTION', `[SEND_PREVIEW] ${content.slice(0, 200)}...`);
 
     try {
-        const chunks = splitForEmbed(content, 1900); // chunk for standard message limit
-
+        const chunks = splitForEmbed(content, 1900);
         for (let i = 0; i < chunks.length; i++) {
-            const chunk = chunks[i];
-            const isLast = i === chunks.length - 1;
-
             await safeReplyTarget(
                 originalMessage,
-                { content: chunk },
-                { preferReply: i === 0 } // Only reply to the specific message for the first chunk
+                { content: chunks[i] },
+                { preferReply: i === 0 }
             );
         }
         logInteraction('ACTION', `[DISCORD_RESPONSE] Sent ${chunks.length} message chunks to Discord.`);
@@ -1190,6 +1153,71 @@ function getJson(url) {
 
 async function discoverCDP() {
     const allTargets = [];
+
+    // 低優先度判定ヘルパー（除外ではなく優先度を下げる）
+    const isLowPriorityTarget = (t) => {
+        const url = String(t.url || '').toLowerCase();
+        const title = String(t.title || '').toLowerCase();
+        if (url.includes('workbench-jetski-agent.html')) return true;
+        if (title.includes('drifting-apogee') || title.includes('perihelion-oort')) return true;
+        return false;
+    };
+
+    // DOM要素数を取得するプローブ（一時的にWebSocket接続→取得→切断）
+    const probeElementCount = async (target) => {
+        try {
+            const ws = new WebSocket(target.webSocketDebuggerUrl);
+            await new Promise((resolve, reject) => {
+                ws.on('open', resolve);
+                ws.on('error', reject);
+                setTimeout(() => reject(new Error('probe timeout')), 5000);
+            });
+            let msgId = 1;
+            const call = (method, params) => new Promise((resolve, reject) => {
+                const id = msgId++;
+                const timeoutId = setTimeout(() => reject(new Error('call timeout')), 5000);
+                const handler = (msg) => {
+                    try {
+                        const d = JSON.parse(msg);
+                        if (d.id === id) {
+                            ws.off('message', handler);
+                            clearTimeout(timeoutId);
+                            if (d.error) reject(d.error); else resolve(d.result);
+                        }
+                    } catch (e) { /* ignore parse errors */ }
+                };
+                ws.on('message', handler);
+                ws.send(JSON.stringify({ id, method, params }));
+            });
+            const res = await call('Runtime.evaluate', {
+                expression: 'document.querySelectorAll("*").length',
+                returnByValue: true
+            });
+            ws.close();
+            return Number(res?.result?.value) || 0;
+        } catch (e) {
+            return 0;
+        }
+    };
+
+    // 候補リストからDOM要素数が最も多いターゲットを選択する
+    // （将来的にはここをUI選択に置き換え可能）
+    const pickBestTarget = async (candidates) => {
+        if (candidates.length === 0) return null;
+        if (candidates.length === 1) return candidates[0];
+
+        // 複数候補がある場合のみプローブを実行
+        console.log(`[CDP] Multiple candidates (${candidates.length}). Probing element counts...`);
+        const probed = [];
+        for (const t of candidates) {
+            const count = await probeElementCount(t);
+            console.log(`[CDP]   "${t.title}" => ${count} elements`);
+            probed.push({ target: t, elementCount: count });
+        }
+        probed.sort((a, b) => b.elementCount - a.elementCount);
+        return probed[0].target;
+    };
+
     for (const port of PORTS) {
         try {
             const list = await getJson(`http://127.0.0.1:${port}/json/list`);
@@ -1206,7 +1234,7 @@ async function discoverCDP() {
 
     if (allTargets.length === 0) throw new Error("CDP not found.");
 
-    // If a target was explicitly selected, try to find it
+    // 手動選択されたターゲットがある場合はそれを使用
     if (explicitTargetUrl) {
         const selected = allTargets.find(t => t.webSocketDebuggerUrl === explicitTargetUrl);
         if (selected) {
@@ -1215,47 +1243,70 @@ async function discoverCDP() {
         }
     }
 
-    // Priorities
-    // 1. HIGHEST: Title starts with a real folder name (e.g. "workspace - Antigravity - ...") 
-    //    Accept even if "Walkthrough" is in the title - it means a tab in that window, not a pure walkthrough window.
-    let target = allTargets.find(t =>
-        t.type === 'page' &&
-        !t.title.toLowerCase().startsWith('walkthrough') &&   // pure walkthrough window
-        !t.title.toLowerCase().startsWith('launchpad') &&     // launchpad window
-        !t.url.includes('workbench-jetski-agent') &&
-        (t.url.includes('workbench') || t.title.includes('Antigravity') || t.title.includes('Cascade')) &&
-        (t.title.toLowerCase().includes('workspace') || t.title.toLowerCase().includes('project'))
-    );
+    // --- 優先度に基づくターゲット選択 ---
+    // 同一優先度の候補が複数ある場合、DOM要素数が最も多いものを選択する。
+    // （将来的にはUIで候補リストをユーザーに提示し、手動選択可能にする想定）
 
-    // 2. Any project window that doesn't look like Launchpad or a pure walkthrough
+    // 1. HIGHEST: ワークスペースが開かれているメインの workbench ウィンドウ
+    let target = await pickBestTarget(allTargets.filter(t =>
+        t.type === 'page' &&
+        t.url.includes('workbench.html') &&
+        (t.url.includes('?workspace=') || t.url.includes('&workspace=')) &&
+        !isLowPriorityTarget(t)
+    ));
+
+    // 2. workbench.html だがワークスペースパラメータがないもの（低優先度ターゲットを除く）
     if (!target) {
-        target = allTargets.find(t =>
+        target = await pickBestTarget(allTargets.filter(t =>
             t.type === 'page' &&
-            !t.title.toLowerCase().startsWith('walkthrough') &&
-            !t.title.toLowerCase().startsWith('launchpad') &&
-            !t.url.includes('workbench-jetski-agent') &&
-            (t.url.includes('workbench') || t.title.includes('Antigravity') || t.title.includes('Cascade'))
-        );
+            t.url.includes('workbench.html') &&
+            !isLowPriorityTarget(t)
+        ));
     }
 
-    // 3. Fallback to any project-like target (still avoid launchpad)
+    // 3. 低優先度ターゲット（jetski-agent, drifting-apogee, perihelion-oort）
+    //    通常ターゲットが見つからない場合のフォールバック
     if (!target) {
-        target = allTargets.find(t =>
+        target = await pickBestTarget(allTargets.filter(t =>
             t.type === 'page' &&
-            (t.url.includes('workbench') || t.title.includes('Antigravity') || t.title.includes('Cascade')) &&
-            !t.url.includes('workbench-jetski-agent')
-        );
+            t.url.includes('workbench.html') &&
+            isLowPriorityTarget(t)
+        ));
+    }
+
+    // 4. Last fallback: タイトルまたは URL に Antigravity / Cascade を含むもの
+    if (!target) {
+        target = await pickBestTarget(allTargets.filter(t =>
+            t.type === 'page' &&
+            (t.url.includes('workbench') || t.title.includes('Antigravity') || t.title.includes('Cascade'))
+        ));
     }
 
     if (target) {
-        console.log(`[CDP] Connected to target: ${target.title} (${target.url})`);
+        const lowPri = isLowPriorityTarget(target);
+        console.log(`\n========================================`);
+        console.log(`[CDP] === CONNECTED TO TARGET ===`);
+        console.log(`[CDP] Title: ${target.title}`);
+        console.log(`[CDP] URL: ${target.url}`);
+        if (lowPri) console.log(`[CDP] Note: This is a low-priority target.`);
+        console.log(`========================================\n`);
         return { port: target.port, url: target.webSocketDebuggerUrl };
     }
     throw new Error("Suitable CDP target not found.");
 }
 
+
 async function listAllCDPTargets() {
     const allTargets = [];
+
+    const isIgnoredTarget = (t) => {
+        const url = String(t.url || '').toLowerCase();
+        const title = String(t.title || '').toLowerCase();
+        if (url.includes('workbench-jetski-agent.html')) return true;
+        if (title.includes('drifting-apogee') || title.includes('perihelion-oort')) return true;
+        return false;
+    };
+
     for (const port of PORTS) {
         try {
             const list = await getJson(`http://127.0.0.1:${port}/json/list`);
@@ -1491,9 +1542,8 @@ async function getLastResponseAcrossTargets() {
 
     if (candidates.length === 0) return null;
 
-    const validCandidates = candidates.filter(c => !isLowConfidenceResponse(c.response));
-
-    const launchpad = validCandidates
+    // Launchpad ターゲットを優先
+    const launchpad = candidates
         .filter(c => {
             const title = String(c?.target?.title || '').toLowerCase();
             const url = String(c?.target?.url || '').toLowerCase();
@@ -1504,11 +1554,6 @@ async function getLastResponseAcrossTargets() {
     if (launchpad.length > 0) {
         logInteraction('ACTION', `[TARGET_SCAN] selecting Launchpad target: "${launchpad[0].target.title}" score=${launchpad[0].score}`);
         return launchpad[0].response || null;
-    }
-
-    if (validCandidates.length > 0) {
-        const bestValid = validCandidates.sort((a, b) => b.score - a.score)[0];
-        return bestValid?.response || null;
     }
 
     const best = candidates.sort((a, b) => b.score - a.score)[0];
@@ -1567,22 +1612,10 @@ async function ensureWatchDir() {
 // --- DOM SCRIPTS ---
 async function injectMessage(cdp, text) {
     const safeText = JSON.stringify(text);
+    // チャットパネルはメイン document 上（antigravity-agent-side-panel）にあるため、
+    // iframe 走査は不要。メイン document から直接入力欄を探す。
     const EXP = `(async () => {
         const SELECTORS = ${JSON.stringify(SELECTORS)};
-
-        function getTargetDocs() {
-            const docs = [];
-            const iframes = document.querySelectorAll('iframe');
-            for (let i = 0; i < iframes.length; i++) {
-                if ((iframes[i].src || '').includes('cascade-panel')) {
-                    try {
-                        if (iframes[i].contentDocument) docs.push(iframes[i].contentDocument);
-                    } catch (e) {}
-                }
-            }
-            docs.push(document);
-            return docs;
-        }
 
         function isVisible(el) {
             if (!el) return false;
@@ -1604,34 +1637,31 @@ async function injectMessage(cdp, text) {
             return ['send', 'run', 'submit'].includes(txt);
         }
 
-        function getSnapshot(doc, editor) {
+        function getSnapshot(editor) {
             return {
-                messageCount: doc.querySelectorAll('[data-message-role]').length,
+                messageCount: document.querySelectorAll('[data-message-role]').length,
                 editorChars: ((editor && editor.innerText) || '').trim().length,
-                cancelVisible: Boolean(doc.querySelector('[data-tooltip-id="input-send-button-cancel-tooltip"]'))
+                cancelVisible: Boolean(document.querySelector('[data-tooltip-id="input-send-button-cancel-tooltip"]'))
             };
         }
 
-        async function fillEditor(doc, editor, value) {
+        async function fillEditor(editor, value) {
             editor.focus();
 
-            // DOMのSelectionではなく、エディタ(Lexical)に全選択を通知するためのキーイベント
+            // Lexicalエディタに全選択を通知するキーイベント
             const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
             const eventInit = { bubbles: true, cancelable: true, key: 'a', code: 'KeyA', keyCode: 65, which: 65 };
             if (isMac) eventInit.metaKey = true;
             else eventInit.ctrlKey = true;
             
             editor.dispatchEvent(new KeyboardEvent('keydown', eventInit));
-
-            // エディタのReact状態（選択範囲）が更新されるまで待機
             await new Promise(r => setTimeout(r, 50));
 
             try {
                 // クリップボードからの貼り付けをシミュレート
-                // 全選択状態のため、完全に古いテキストを置き換える
                 const dataTransfer = new DataTransfer();
                 dataTransfer.setData('text/plain', value);
-                dataTransfer.setData('text/html', value.replace(/\\n/g, '<br>'));
+                dataTransfer.setData('text/html', value.replace(/\\\\n/g, '<br>'));
                 
                 const pasteEvent = new ClipboardEvent('paste', {
                     clipboardData: dataTransfer,
@@ -1641,11 +1671,9 @@ async function injectMessage(cdp, text) {
                 
                 editor.dispatchEvent(pasteEvent);
             } catch (e) {
-                // フォールバック
                 editor.innerText = value;
             }
 
-            // エディタに変更を通知
             editor.dispatchEvent(new Event('input', { bubbles: true }));
             editor.dispatchEvent(new Event('change', { bubbles: true }));
         }
@@ -1657,9 +1685,9 @@ async function injectMessage(cdp, text) {
             editor.dispatchEvent(new KeyboardEvent('keyup', eventInit));
         }
 
-        async function trySubmit(doc, editor) {
-            const before = getSnapshot(doc, editor);
-            const buttons = Array.from(doc.querySelectorAll('button, [role="button"]'));
+        async function trySubmit(editor) {
+            const before = getSnapshot(editor);
+            const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
             const submit = buttons.find(isSubmitButton);
             let method = 'enter';
 
@@ -1672,7 +1700,7 @@ async function injectMessage(cdp, text) {
 
             for (let i = 0; i < 8; i++) {
                 await new Promise(r => setTimeout(r, 300));
-                const after = getSnapshot(doc, editor);
+                const after = getSnapshot(editor);
                 const submitted =
                     after.cancelVisible ||
                     after.messageCount > before.messageCount ||
@@ -1684,7 +1712,7 @@ async function injectMessage(cdp, text) {
                 pressEnter(editor);
                 for (let i = 0; i < 6; i++) {
                     await new Promise(r => setTimeout(r, 300));
-                    const after = getSnapshot(doc, editor);
+                    const after = getSnapshot(editor);
                     const submitted =
                         after.cancelVisible ||
                         after.messageCount > before.messageCount ||
@@ -1696,33 +1724,18 @@ async function injectMessage(cdp, text) {
             return { ok: false, error: 'submit_not_confirmed' };
         }
 
-        const docs = getTargetDocs();
-        for (const doc of docs) {
-            const editors = Array.from(doc.querySelectorAll(SELECTORS.CHAT_INPUT)).filter(isVisible);
-            const editor = editors.at(-1);
-            if (!editor) continue;
+        // メイン document から直接入力欄を探す
+        const editors = Array.from(document.querySelectorAll(SELECTORS.CHAT_INPUT)).filter(isVisible);
+        const editor = editors.at(-1);
+        if (!editor) return { ok: false, error: 'No visible editor found' };
 
-            await fillEditor(doc, editor, ${safeText});
-            await new Promise(r => setTimeout(r, 400));
-            const result = await trySubmit(doc, editor);
-            if (result.ok) return result;
-        }
-
-        return { ok: false, error: 'No editor or submission not confirmed in this context' };
+        await fillEditor(editor, ${safeText});
+        await new Promise(r => setTimeout(r, 400));
+        return await trySubmit(editor);
     })()`;
 
-    // Strategy: Prioritize context that looks like cascade-panel
-    const targetContexts = cdp.contexts.filter(c =>
-        (c.url && c.url.includes(SELECTORS.CONTEXT_URL_KEYWORD)) ||
-        (c.name && c.name.includes('Extension')) // Fallback
-    );
-
-    // If no specific context found, try all
-    const contextsToTry = targetContexts.length > 0 ? targetContexts : cdp.contexts;
-
-    console.log(`Injecting message. Priority contexts: ${targetContexts.length}, Total: ${cdp.contexts.length}`);
-
-    for (const ctx of contextsToTry) {
+    // 全コンテキストを試す（メイン document のコンテキストで成功するはず）
+    for (const ctx of cdp.contexts) {
         try {
             const res = await cdp.call("Runtime.evaluate", { expression: EXP, returnByValue: true, awaitPromise: true, contextId: ctx.id });
             if (res.result?.value?.ok) {
@@ -1732,46 +1745,18 @@ async function injectMessage(cdp, text) {
             if (res.result?.value?.error) {
                 console.log(`[Injection Fail] Context ${ctx.id}: ${res.result.value.error}`);
             }
-        } catch (e) {
-            // console.log(`[Injection Error] Context ${ctx.id}: ${e.message}`);
-        }
-    }
-
-    // Fallback: Try ALL contexts if priority ones failed
-    if (targetContexts.length > 0) {
-        const otherContexts = cdp.contexts.filter(c => !targetContexts.includes(c));
-        for (const ctx of otherContexts) {
-            try {
-                const res = await cdp.call("Runtime.evaluate", { expression: EXP, returnByValue: true, awaitPromise: true, contextId: ctx.id });
-                if (res.result?.value?.ok) {
-                    logInteraction('INJECT', `Sent: ${text} (${res.result.value.method || 'unknown'} / Fallback Context: ${ctx.id})`);
-                    return res.result.value;
-                }
-            } catch (e) { }
-        }
+        } catch (e) { }
     }
 
     return { ok: false, error: `Injection failed. Tried ${cdp.contexts.length} contexts.` };
 }
 
+
 async function checkIsGenerating(cdp) {
+    // メイン document からキャンセルボタンの存在を直接確認する
     const EXP = `(() => {
-        function findAgentFrame(win) {
-             const iframes = document.querySelectorAll('iframe');
-             for(let i=0; i<iframes.length; i++) {
-                 if(iframes[i].src.includes('cascade-panel')) {
-                     try { return iframes[i].contentDocument; } catch(e){}
-                 }
-             }
-             return document;
-        }
-
-        const doc = findAgentFrame(window);
-        
-        const cancel = doc.querySelector('[data-tooltip-id="input-send-button-cancel-tooltip"]');
-        if (cancel && cancel.offsetParent !== null) return true;
-
-        return false;
+        const cancel = document.querySelector('[data-tooltip-id="input-send-button-cancel-tooltip"]');
+        return !!(cancel && cancel.offsetParent !== null);
     })()`;
     for (const ctx of cdp.contexts) {
         try {
@@ -1794,168 +1779,137 @@ async function waitForGenerationStart(cdp, timeoutMs = 8000) {
 }
 
 async function checkApprovalRequired(cdp) {
-    const EXP = `(async () => {
-        // 対象の iframe（cascade-panel 等）またはメインドキュメントを探す
-        const docs = [];
-        const iframes = document.querySelectorAll('iframe');
-        for (let i = 0; i < iframes.length; i++) {
-            if (iframes[i].src.includes('cascade-panel')) {
-                try { 
-                    if (iframes[i].contentDocument) docs.push(iframes[i].contentDocument); 
-                } catch(e) {}
-            }
+    // メイン document から承認ダイアログのボタンを探す
+    // Safe Click: 親コンテナ内に拒否ボタン（Reject等）が存在する場合のみ本物と判定
+    const EXP = `(() => {
+        const SELECTORS = ${JSON.stringify(SELECTORS)};
+
+        function getButtonText(btn) {
+            const span = btn.querySelector('span.truncate');
+            return span ? (span.textContent || '').trim().toLowerCase() : '';
         }
-        if (docs.length === 0) docs.push(document);
 
-        // キーワード設定
-        const TARGET_KEYWORDS = ['run', 'allow once'];
-        const EXCLUDE_KEYWORDS = ['always', '常に'];
+        function isApproveButton(text) {
+            return SELECTORS.APPROVAL_KEYWORDS.some(kw => text === kw || text.startsWith(kw + ' '));
+        }
 
-        for (const doc of docs) {
-            const buttons = Array.from(doc.querySelectorAll('button, div[role="button"]'));
-            if (buttons.length === 0) continue;
+        function isRejectButton(text) {
+            return SELECTORS.CANCEL_KEYWORDS.some(kw => text === kw || text.startsWith(kw + ' '));
+        }
 
-            for (const btn of buttons) {
-                // DOM.getOuterHTML の代わりに簡易的に outerHTML を取得
-                const html = (btn.outerHTML || '').toLowerCase();
+        const buttons = Array.from(document.querySelectorAll('button'));
+        for (const btn of buttons) {
+            // 非表示ボタンを除外
+            if (btn.offsetWidth === 0 || btn.offsetHeight === 0) continue;
+            // ドロップダウンボタンを除外（"Always run" 等の誤認防止）
+            if (btn.getAttribute('aria-haspopup') === 'listbox') continue;
 
-                // HTMLタグを除去してテキストのみを抽出 (改行も含めて抽出してから正規化する)
-                let text = html.replace(/<[^>]+>/g, ' ');
-                text = text.replace(/&nbsp;/g, ' ').replace(/\\s+/g, ' ').trim();
+            const text = getButtonText(btn);
+            if (!text || !isApproveButton(text)) continue;
 
-                let isExcluded = false;
-                for (const ex of EXCLUDE_KEYWORDS) {
-                    if (text.includes(ex)) {
-                        isExcluded = true;
-                        break;
-                    }
-                }
-                if (isExcluded) continue;
+            // Safe Click: 親コンテナ内に拒否ボタンが存在するか検証
+            // 3ボタン構成（例: Reject / Run / Always Allow）にも対応
+            const container = btn.parentElement;
+            if (!container) continue;
+            const siblings = Array.from(container.querySelectorAll('button'))
+                .filter(s => s.offsetWidth > 0 && s.offsetHeight > 0 && s.getAttribute('aria-haspopup') !== 'listbox');
 
-                let matchedKeyword = null;
-                for (const kw of TARGET_KEYWORDS) {
-                    const lowerKw = kw.toLowerCase();
-                    if (text === lowerKw || text.startsWith(lowerKw + ' ')) {
-                        matchedKeyword = kw;
-                        break;
-                    }
-                }
-
-                if (matchedKeyword) {
-                    // 非表示ボタンの判定（簡易）
-                    if (btn.offsetWidth === 0 || btn.offsetHeight === 0) continue;
-
-                    // 文脈の取得（5階層上まで遡る）
-                    let contextText = 'Action requires approval.';
-                    let ancestor = btn.parentElement;
-                    for (let i = 0; i < 5; i++) {
-                        if (!ancestor || !ancestor.parentElement) break;
-                        ancestor = ancestor.parentElement;
-                    }
-
-                    if (ancestor) {
-                        let clean = (ancestor.outerHTML || '').replace(/<[^>]+>/g, ' ');
-                        clean = clean.replace(/&nbsp;/g, ' ').replace(/[ \\t]+/g, ' ').replace(/\\n{2,}/g, '\\n').trim();
-                        if (clean.length > 500) clean = clean.substring(0, 500) + '...';
-                        if (clean) contextText = clean;
-                    }
-
-                    return { required: true, message: contextText };
-                }
+            // 全兄弟ボタンのラベルを収集
+            const approveLabels = [];
+            const rejectLabels = [];
+            for (const s of siblings) {
+                const st = getButtonText(s);
+                if (!st) continue;
+                // 元のテキストの大文字小文字を保持するため、span から直接取得
+                const originalText = (s.querySelector('span.truncate')?.textContent || '').trim();
+                if (isApproveButton(st)) approveLabels.push(originalText);
+                if (isRejectButton(st)) rejectLabels.push(originalText);
             }
+            if (rejectLabels.length === 0) continue;
+
+            // 文脈テキスト取得（ボタンの祖先要素から）
+            let contextText = 'Action requires approval.';
+            let ancestor = btn;
+            for (let i = 0; i < 5 && ancestor.parentElement; i++) ancestor = ancestor.parentElement;
+            if (ancestor) {
+                let clean = (ancestor.innerText || '').replace(/[ \\t]+/g, ' ').replace(/\\n{2,}/g, '\\n').trim();
+                if (clean.length > 500) clean = clean.substring(0, 500) + '...';
+                if (clean) contextText = clean;
+            }
+            return { required: true, message: contextText, approveLabels, rejectLabels };
         }
         return null;
     })()`;
 
     for (const ctx of cdp.contexts) {
         try {
-            const res = await cdp.call("Runtime.evaluate", { expression: EXP, returnByValue: true, awaitPromise: true, contextId: ctx.id });
+            const res = await cdp.call("Runtime.evaluate", { expression: EXP, returnByValue: true, contextId: ctx.id });
             if (res.result?.value?.required) return res.result.value;
         } catch (e) { }
     }
     return null;
 }
 
-async function clickApproval(cdp, allow) {
+async function clickApproval(cdp, allow, targetLabel = null) {
     const isAllowStr = allow ? 'true' : 'false';
-    const EXP = `(async () => {
-        const docs = [];
-        const iframes = document.querySelectorAll('iframe');
-        for (let i = 0; i < iframes.length; i++) {
-            if (iframes[i].src.includes('cascade-panel')) {
-                try { if (iframes[i].contentDocument) docs.push(iframes[i].contentDocument); } catch(e) {}
-            }
-        }
-        if (docs.length === 0) docs.push(document);
-
+    const safeLabel = targetLabel ? JSON.stringify(targetLabel.toLowerCase()) : 'null';
+    // メイン document から承認/拒否ボタンを探してクリック
+    // targetLabel が指定されている場合はそのラベルのボタンを優先
+    const EXP = `(() => {
+        const SELECTORS = ${JSON.stringify(SELECTORS)};
         const isAllow = ${isAllowStr};
-        const TARGET_KEYWORDS = ['run', 'allow once'];
-        const EXCLUDE_KEYWORDS = ['always', '常に'];
-        const CANCEL_KEYWORDS = ['cancel', 'reject', 'deny', 'ignore', 'キャンセル', '拒否', '無視', 'いいえ'];
-        let log = [];
-        let found = false;
+        const targetLabel = ${safeLabel};
 
-        for (const doc of docs) {
-            if (found) break;
-            const buttons = Array.from(doc.querySelectorAll('button, [role="button"]'));
-            if (buttons.length === 0) continue;
+        function getButtonText(btn) {
+            const span = btn.querySelector('span.truncate');
+            return span ? (span.textContent || '').trim().toLowerCase() : '';
+        }
 
-            for (const btn of buttons) {
-                if (btn.offsetWidth === 0 || btn.offsetHeight === 0) continue;
+        function isApproveButton(text) {
+            return SELECTORS.APPROVAL_KEYWORDS.some(kw => text === kw || text.startsWith(kw + ' '));
+        }
 
-                const html = (btn.outerHTML || '').toLowerCase();
-                let text = html.replace(/<[^>]+>/g, ' ');
-                text = text.replace(/&nbsp;/g, ' ').replace(/\\s+/g, ' ').trim();
+        function isRejectButton(text) {
+            return SELECTORS.CANCEL_KEYWORDS.some(kw => text === kw || text.startsWith(kw + ' '));
+        }
 
-                if (!isAllow) {
-                    let isCancel = false;
-                    for (const kw of CANCEL_KEYWORDS) {
-                        const lowerKw = kw.toLowerCase();
-                        if (text === lowerKw || text.startsWith(lowerKw + ' ')) {
-                            isCancel = true;
-                            break;
-                        }
-                    }
-                    if (isCancel) {
-                        btn.click();
-                        log.push("CLICKING REJECT: " + text.substring(0, 30));
-                        found = true;
-                        break;
-                    }
-                } else {
-                    let isExcluded = false;
-                    for (const ex of EXCLUDE_KEYWORDS) {
-                        if (text.includes(ex)) {
-                            isExcluded = true;
-                            break;
-                        }
-                    }
-                    if (isExcluded) continue;
+        const buttons = Array.from(document.querySelectorAll('button'));
+        for (const btn of buttons) {
+            if (btn.offsetWidth === 0 || btn.offsetHeight === 0) continue;
+            if (btn.getAttribute('aria-haspopup') === 'listbox') continue;
 
-                    let matchedKeyword = null;
-                    for (const kw of TARGET_KEYWORDS) {
-                        const lowerKw = kw.toLowerCase();
-                        if (text === lowerKw || text.startsWith(lowerKw + ' ')) {
-                            matchedKeyword = kw;
-                            break;
-                        }
-                    }
+            const text = getButtonText(btn);
+            if (!text) continue;
 
-                    if (matchedKeyword) {
-                        btn.click();
-                        log.push("CLICKING APPROVE: " + text.substring(0, 30));
-                        found = true;
-                        break;
-                    }
-                }
+            // Safe Click: 親コンテナ内に対となるボタンが存在するか検証
+            const container = btn.parentElement;
+            if (!container) continue;
+            const siblings = Array.from(container.querySelectorAll('button'))
+                .filter(s => s.offsetWidth > 0 && s.offsetHeight > 0 && s.getAttribute('aria-haspopup') !== 'listbox');
+
+            if (isAllow && isApproveButton(text)) {
+                // targetLabel が指定されている場合はそのラベルのみクリック
+                if (targetLabel && text !== targetLabel) continue;
+                const hasReject = siblings.some(s => s !== btn && isRejectButton(getButtonText(s)));
+                if (!hasReject) continue;
+                btn.click();
+                return { success: true, log: ['CLICKING APPROVE: ' + text] };
+            }
+
+            if (!isAllow && isRejectButton(text)) {
+                if (targetLabel && text !== targetLabel) continue;
+                const hasApprove = siblings.some(s => s !== btn && isApproveButton(getButtonText(s)));
+                if (!hasApprove) continue;
+                btn.click();
+                return { success: true, log: ['CLICKING REJECT: ' + text] };
             }
         }
-        return { success: found, log: log };
+        return { success: false, log: [] };
     })()`;
 
     for (const ctx of cdp.contexts) {
         try {
-            const evalPromise = cdp.call("Runtime.evaluate", { expression: EXP, returnByValue: true, awaitPromise: true, contextId: ctx.id });
+            const evalPromise = cdp.call("Runtime.evaluate", { expression: EXP, returnByValue: true, contextId: ctx.id });
             const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000));
             const res = await Promise.race([evalPromise, timeoutPromise]);
             if (res.result?.value?.success) {
@@ -1970,262 +1924,135 @@ async function clickApproval(cdp, allow) {
 
 
 async function getLastResponse(cdp) {
-    // Note: This logic incorporates incremental scroll + pure text extraction (v12 architecture)
-    const EXP = `(async () => {
-        function getTargetDocs() {
-            const docs = [document];
-            try {
-                const iframes = document.querySelectorAll('iframe');
-                for (let i = 0; i < iframes.length; i++) {
-                    try {
-                        const src = String(iframes[i].src || '');
-                        if (src.includes('cascade-panel')) {
-                            const d = iframes[i].contentDocument;
-                            if (d) docs.push(d);
+    // antigravity-agent-side-panel 内から最新AIレスポンスを抽出
+    // スクロール廃止、iframe走査廃止、同期的にDOMから直接取得
+    const RAW_CHAR_LIMIT = 4000;   // 回答全文テキストの最大文字数（下から）
+    const REPLY_CHAR_LIMIT = 1900; // 返信テキストの最大文字数（下から）
+
+    // CDP式: ブラウザ内で実行されるレスポンス抽出スクリプト
+    // テンプレートリテラルのエスケープ問題を避けるため、定数は直接埋め込む
+    const EXP = '(' + function (RAW_LIMIT, REPLY_LIMIT) {
+        try {
+            // メッセージコンテナを取得
+            var msgContainer = document.querySelector('.relative.flex.flex-col.gap-y-3.px-4');
+            if (!msgContainer) return { text: '', debug: 'msgContainer not found' };
+
+            var blocks = Array.from(msgContainer.children);
+            if (blocks.length === 0) return { text: '', debug: 'no children in msgContainer' };
+
+            // 下から走査して最新のユーザー送信ブロック（undoボタンを持つ）を見つける
+            var userBlockIdx = -1;
+            for (var i = blocks.length - 1; i >= 0; i--) {
+                var undo = blocks[i].querySelector('[data-tooltip-id*="undo"], [title*="Undo"]');
+                if (undo) { userBlockIdx = i; break; }
+            }
+
+            // レスポンス対象ブロック: ユーザーの次から末尾まで
+            // AIの回答がユーザーと同じブロック内にある場合もあるため、
+            // ユーザーの後にブロックがなければユーザーブロック自体を含める
+            var startIdx = userBlockIdx >= 0 ? userBlockIdx + 1 : 0;
+            if (startIdx >= blocks.length && userBlockIdx >= 0) startIdx = userBlockIdx;
+            var responseBlocks = blocks.slice(startIdx);
+            if (responseBlocks.length === 0) return { text: '', debug: 'no response blocks, userBlockIdx=' + userBlockIdx + ' total=' + blocks.length };
+
+            var cleanedTexts = [];
+            for (var bi = 0; bi < responseBlocks.length; bi++) {
+                var block = responseBlocks[bi];
+                var clone = block.cloneNode(true);
+
+                // ノイズ除去: Thought / Ran command ヘッダーと関連コンテナ
+                var allEls = Array.from(clone.querySelectorAll('*'));
+                for (var ei = 0; ei < allEls.length; ei++) {
+                    var el = allEls[ei];
+                    if (!el.parentNode) continue;
+                    var elText = (el.innerText || '').trim();
+                    if (!elText) continue;
+                    var isThought = (/^Thought for/.test(elText) && elText.length < 30) || elText === 'Thought Process';
+                    var logHeaders = ['Ran command', 'Ran background command', 'Ran terminal command', 'Analyzed', 'Running command', 'Always run', 'Exit code', 'Error during'];
+                    var isLog = false;
+                    for (var li = 0; li < logHeaders.length; li++) {
+                        if (elText.indexOf(logHeaders[li]) === 0 && elText.length < 30) { isLog = true; break; }
+                    }
+                    if (isThought || isLog) {
+                        var container = el.closest('details') || el.closest('.border') || el.closest('.bg-ide-bg') || el.closest('.rounded') || el.parentElement;
+                        if (container && container.parentNode) {
+                            container.parentNode.replaceChild(document.createTextNode(' '), container);
                         }
-                    } catch (e) {}
+                    }
                 }
-            } catch (e) {}
-            return docs;
+
+                // style 要素を除去
+                var styles = Array.from(clone.querySelectorAll('style'));
+                for (var si = 0; si < styles.length; si++) {
+                    if (styles[si].parentNode) styles[si].parentNode.removeChild(styles[si]);
+                }
+
+                // Good/Bad ボタンを除去
+                var btns = Array.from(clone.querySelectorAll('button'));
+                for (var bti = 0; bti < btns.length; bti++) {
+                    var btnText = (btns[bti].innerText || '').trim();
+                    if (btnText === 'Good' || btnText === 'Bad') {
+                        var wrap = btns[bti].closest('.flex');
+                        if (wrap && wrap.parentNode) wrap.parentNode.removeChild(wrap);
+                        else if (btns[bti].parentNode) btns[bti].parentNode.removeChild(btns[bti]);
+                    }
+                }
+
+                // ユーザーの吹き出し（undoボタンがあるブロック内）も除去
+                var undos = Array.from(clone.querySelectorAll('[data-tooltip-id*="undo"], [title*="Undo"]'));
+                for (var ui = 0; ui < undos.length; ui++) {
+                    var bubble = undos[ui].closest('.whitespace-pre-wrap') || undos[ui].parentElement;
+                    if (bubble && bubble.parentNode) bubble.parentNode.replaceChild(document.createTextNode(' '), bubble);
+                }
+
+                // レイアウトを保持してテキスト取得
+                clone.style.cssText = 'position:absolute;left:-9999px;top:0;opacity:0;pointer-events:none;width:800px';
+                document.body.appendChild(clone);
+                var text = clone.innerText;
+                document.body.removeChild(clone);
+
+                // クリーンアップ
+                text = text.replace(/Good\s*Bad\s*$/g, '').replace(/\n{3,}/g, '\n\n').trim();
+                if (text) cleanedTexts.push(text);
+            }
+
+            if (cleanedTexts.length === 0) return { text: '', debug: 'cleanedTexts empty, responseBlocks=' + responseBlocks.length };
+
+            // 回答全文テキスト（下から最大文字数）
+            var rawResponse = cleanedTexts.join('\n\n');
+            if (rawResponse.length > RAW_LIMIT) rawResponse = rawResponse.slice(-RAW_LIMIT);
+
+            // 返信テキスト（下から最大文字数）
+            var replyText = rawResponse;
+            if (replyText.length > REPLY_LIMIT) replyText = replyText.slice(-REPLY_LIMIT);
+
+            return { text: replyText, rawLength: rawResponse.length };
+        } catch (e) {
+            return { text: '', debug: 'Exception: ' + String(e.message || e) };
         }
-
-        async function processScrollExtraction() {
-            const CHAR_LIMIT = 4000;
-            const capturedBlocks = new Set();
-            const results = [];
-            let totalLength = 0;
-            
-            let isCollectingReply = false;
-            let replyBuffer = [];
-            let foundLatestUser = false;
-            let domDebug = { loops: 0, blocksFiltered: 0, extractedLength: 0 };
-
-            // 背景色からユーザーの吹き出しを特定するヘルパー
-            function findUserBubbleByComputedStyle(startEl, fallbackSelector) {
-                if (!startEl) return null;
-                const container = document.querySelector('.relative.flex.flex-col.gap-y-3.px-4') || document.body;
-                let bgStyle = '';
-                try {
-                    bgStyle = window.getComputedStyle(container).backgroundColor;
-                } catch (e) {}
-                let current = startEl;
-                while (current && current !== document.body && current !== container) {
-                    try {
-                        const s = window.getComputedStyle(current);
-                        const c = s.backgroundColor;
-                        if (c && c !== 'rgba(0, 0, 0, 0)' && c !== 'transparent' && c !== bgStyle) {
-                            return current;
-                        }
-                    } catch (e) {}
-                    current = current.parentElement;
-                }
-                return startEl.closest(fallbackSelector) || startEl.parentElement;
-            }
-
-            const scrollContainer = document.querySelector('.h-full.overflow-y-auto');
-            if (scrollContainer) scrollContainer.scrollTop = 999999;
-            await new Promise(r => setTimeout(r, 500));
-
-            for (let step = 0; step < 15; step++) {
-                domDebug.loops++;
-                const msgContainer = document.querySelector('.relative.flex.flex-col.gap-y-3.px-4');
-                if (!msgContainer) break;
-                
-                const blockResults = [];
-                const blocks = Array.from(msgContainer.children);
-                
-                blocks.forEach(block => {
-                    const blockId = (block.innerText || '').substring(0, 100);
-                    if (!blockId) return;
-
-                    let userText = "";
-                    let cleanAiText = "";
-
-                    // --- 1. User送信テキストの抽出 ---
-                    const undoEl = block.querySelector('[data-tooltip-id*="undo"]') || block.querySelector('[title*="Undo"]');
-                    if (undoEl) {
-                        let userBubble = findUserBubbleByComputedStyle(undoEl, '.whitespace-pre-wrap');
-                        while (userBubble && userBubble.parentElement && userBubble.innerText.length < 10 && userBubble.parentElement !== block) {
-                            userBubble = userBubble.parentElement;
-                        }
-                        if (userBubble) {
-                            userBubble.setAttribute('data-ag-user-bubble', 'true');
-                        }
-                        userText = userBubble ? userBubble.innerText.trim() : undoEl.parentElement.innerText.trim();
-                    }
-
-                    const hasGoodBad = !!block.querySelector('button') && block.innerText.includes('Good') && block.innerText.includes('Bad');
-
-                    // --- 2. ノイズ要素を除外したDOMのクローンを作成 ---
-                    const clone = block.cloneNode(true);
-
-                    // クローン後に元のDOMに付けたマーカーは削除する
-                    if (undoEl) {
-                        const originalUserBubbles = block.querySelectorAll('[data-ag-user-bubble="true"]');
-                        for (let i = 0; i < originalUserBubbles.length; i++) {
-                            originalUserBubbles[i].removeAttribute('data-ag-user-bubble');
-                        }
-                    }
-
-                    function replaceWithNewlines(container) {
-                        if (!container || !container.parentNode) return;
-                        const marker = document.createTextNode('\\n\\n');
-                        container.parentNode.replaceChild(marker, container);
-                    }
-
-                    Array.from(clone.querySelectorAll('[data-tooltip-id*="undo"], [title*="Undo"]')).forEach(cu => {
-                        let cuBubble = cu.closest('[data-ag-user-bubble="true"]') || cu.closest('.whitespace-pre-wrap') || cu.parentElement;
-                        if (cuBubble && cuBubble.parentNode) replaceWithNewlines(cuBubble);
-                    });
-
-                    Array.from(clone.querySelectorAll('*')).forEach(el => {
-                        if (!el.parentNode) return;
-                        const text = (el.innerText || '').trim();
-                        if (!text) return;
-
-                        const isThoughtHeader = /^Thought for/.test(text) && text.length < 30 || text === 'Thought Process';
-                        const isLogHeader = ['Ran command', 'Ran background command', 'Ran terminal command', 'Analyzed', 'Running command', 'Always run', 'Exit code', 'Error during'].some(h => text.startsWith(h) && text.length < 30);
-                        
-                        if (isThoughtHeader) {
-                            let container = el.closest('details') || el.closest('.border') || el.closest('.rounded') || el.parentElement;
-                            if (container && container.parentNode && container.innerText.includes(text)) {
-                                replaceWithNewlines(container);
-                                domDebug.blocksFiltered++;
-                            }
-                        } else if (isLogHeader) {
-                            let container = el.closest('.border') || el.closest('.bg-ide-bg') || el.closest('.rounded') || el.parentElement;
-                            if (container && container.parentNode && container.innerText.includes(text)) {
-                                replaceWithNewlines(container);
-                                domDebug.blocksFiltered++;
-                            }
-                        }
-                    });
-
-                    Array.from(clone.querySelectorAll('style')).forEach(s => {
-                        if (s.parentNode) s.parentNode.removeChild(s);
-                    });
-
-                    Array.from(clone.querySelectorAll('button')).forEach(btn => {
-                        const btnText = (btn.innerText || '').trim();
-                        if (btnText === 'Good' || btnText === 'Bad') {
-                            let wrap = btn.closest('.flex');
-                            if (wrap && wrap.parentNode) {
-                                wrap.parentNode.removeChild(wrap);
-                            } else if (btn.parentNode) {
-                                btn.parentNode.removeChild(btn);
-                            }
-                        }
-                    });
-
-                    // --- 3. クリーンなテキストの取得 (Layout保持) ---
-                    Object.assign(clone.style, { position: 'absolute', left: '-9999px', top: '0', opacity: '0', pointerEvents: 'none', width: '800px' });
-                    document.body.appendChild(clone);
-                    const rawText = clone.innerText;
-                    document.body.removeChild(clone);
-
-                    cleanAiText = rawText
-                        .replace(/\\/\\*\\s*Copied from remark-github-blockquote-alert.*?[\\s\\S]*?padding:\\s*\\.\\drem\\s*1em\\s*\\}/gi, '') 
-                        .replace(/Good\\s*Bad$/, '');
-                        
-                    cleanAiText = cleanAiText.replace(/\\n{3,}/g, '\\n\\n').trim();
-
-                    blockResults.push({
-                        id: blockId,
-                        user: userText,
-                        aiCleaned: cleanAiText,
-                        hasGoodBad: hasGoodBad
-                    });
-                });
-
-                // 下から上にパース
-                for (let i = blockResults.length - 1; i >= 0; i--) {
-                    const b = blockResults[i];
-                    if (capturedBlocks.has(b.id)) continue;
-                    capturedBlocks.add(b.id);
-
-                    if (b.aiCleaned && b.hasGoodBad) {
-                        results.unshift({ role: 'AI (返答)', content: b.aiCleaned });
-                        totalLength += b.aiCleaned.length;
-                    } else if (b.aiCleaned) {
-                        results.unshift({ role: 'AI', content: b.aiCleaned });
-                        totalLength += b.aiCleaned.length;
-                    }
-                    if (b.user) {
-                        results.unshift({ role: 'User', content: b.user });
-                        totalLength += b.user.length;
-                    }
-
-                    if (!foundLatestUser) {
-                        if (b.hasGoodBad) isCollectingReply = true;
-                        if (isCollectingReply && b.aiCleaned) replyBuffer.unshift(b.aiCleaned);
-                        if (b.user) {
-                            foundLatestUser = true;
-                            isCollectingReply = false;
-                        }
-                    }
-                    if (totalLength >= CHAR_LIMIT) break;
-                }
-
-                if (totalLength >= CHAR_LIMIT || foundLatestUser) break;
-
-                if (scrollContainer) {
-                    scrollContainer.scrollTop -= 1000;
-                    await new Promise(r => setTimeout(r, 600));
-                } else {
-                    break;
-                }
-            }
-
-            if (scrollContainer) scrollContainer.scrollTop = 999999;
-            await new Promise(r => setTimeout(r, 200));
-
-            let finalAns = replyBuffer.join('\\n\\n').trim();
-            domDebug.extractedLength = finalAns.length;
-            
-            // Limit to Discord's safe 1900 chars
-            if (finalAns.length > 1900) {
-                finalAns = finalAns.slice(-1900);
-            }
-
-            if (!finalAns) return null;
-
-            return {
-                text: finalAns,
-                markdown: finalAns,
-                images: [],
-                score: 250000,
-                selector: 'v12-incremental-scroll-pure-extraction',
-                messageRoleCount: 1,
-                domDebug: domDebug
-            };
-        }
-
-        // cascade-panelなども順番に試す
-        const docs = getTargetDocs();
-        const mainRes = await processScrollExtraction();
-        if (mainRes) return mainRes;
-
-        return null;
-    })()`;
+    } + ')(' + RAW_CHAR_LIMIT + ',' + REPLY_CHAR_LIMIT + ')';
 
     for (const ctx of cdp.contexts) {
         try {
-            // Promise.race timeout for the evaluate call (increased to 30s to allow scrolling)
             const res = await Promise.race([
-                cdp.call("Runtime.evaluate", { expression: EXP, awaitPromise: true, returnByValue: true, contextId: ctx.id }),
-                new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 30000))
+                cdp.call("Runtime.evaluate", { expression: EXP, returnByValue: true, contextId: ctx.id }),
+                new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 10000))
             ]);
+            // CDP式の実行エラーをログに出力
+            if (res.exceptionDetails) {
+                logInteraction('ERROR', `getLastResponse CDP exception in ctx ${ctx.id}: ${JSON.stringify(res.exceptionDetails.text || res.exceptionDetails)}`);
+                continue;
+            }
             const v = res.result?.value;
             if (!v) continue;
+            // デバッグ情報があればログ出力
+            if (v.debug) {
+                logInteraction('ERROR', `getLastResponse debug info (ctx ${ctx.id}): ${v.debug}`);
+            }
             if (!String(v.text || '').trim()) continue;
             return {
                 text: String(v.text).trim(),
-                markdown: String(v.markdown || v.text).trim(),
-                images: Array.isArray(v.images) ? v.images : [],
-                score: Number(v.score || 0),
-                selector: v.selector || 'unknown',
-                messageRoleCount: Number(v.messageRoleCount || 0),
-                domDebug: v.domDebug || null,
+                rawLength: v.rawLength || 0,
                 contextId: ctx.id
             };
         } catch (e) {
@@ -2837,13 +2664,21 @@ async function monitorAIResponse(originalMessage, cdp) {
                 }
 
                 if (autoApproveMode) {
-                    // Try auto-approve first so Discord test flow does not stall on modal prompts.
-                    const autoApprovalResult = await clickApproval(cdp, true);
-                    if (autoApprovalResult?.success) {
-                        logInteraction('APPROVAL', `Auto-approved request: ${approval.message.substring(0, 50)}...`);
-                        lastApprovalMessage = null;
-                        setTimeout(poll, POLLING_INTERVAL);
-                        return;
+                    // Smart Safety: 破壊的コマンドが含まれる場合は自動承認をスキップ
+                    const msgLower = approval.message.toLowerCase();
+                    const dangerousMatch = SELECTORS.DANGEROUS_COMMANDS.find(cmd => msgLower.includes(cmd.toLowerCase()));
+                    if (dangerousMatch) {
+                        console.log(`[SAFETY] Dangerous command detected: "${dangerousMatch}" — Forcing manual approval via Discord.`);
+                        // 自動承認をスキップし、以降のDiscord通知フローに進む
+                    } else {
+                        // 安全なコマンド → 自動承認
+                        const autoApprovalResult = await clickApproval(cdp, true);
+                        if (autoApprovalResult?.success) {
+                            logInteraction('APPROVAL', `Auto-approved request: ${approval.message.substring(0, 50)}...`);
+                            lastApprovalMessage = null;
+                            setTimeout(poll, POLLING_INTERVAL);
+                            return;
+                        }
                     }
                 }
 
@@ -2855,16 +2690,31 @@ async function monitorAIResponse(originalMessage, cdp) {
 
                 lastApprovalMessage = approval.message;
 
-                const row = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder()
-                        .setCustomId('approve_action')
-                        .setLabel('Approve')
-                        .setStyle(ButtonStyle.Success),
-                    new ButtonBuilder()
-                        .setCustomId('reject_action')
-                        .setLabel('Reject')
-                        .setStyle(ButtonStyle.Danger)
-                );
+                // Antigravity側のボタンラベルをそのままDiscordボタンに反映
+                const approveLabels = approval.approveLabels || ['Approve'];
+                const rejectLabels = approval.rejectLabels || ['Reject'];
+                const allButtons = [];
+
+                // 拒否ボタン（赤）
+                for (const label of rejectLabels) {
+                    allButtons.push(
+                        new ButtonBuilder()
+                            .setCustomId('reject_' + label.toLowerCase().replace(/\s+/g, '_'))
+                            .setLabel(label)
+                            .setStyle(ButtonStyle.Danger)
+                    );
+                }
+                // 承認ボタン（緑）
+                for (const label of approveLabels) {
+                    allButtons.push(
+                        new ButtonBuilder()
+                            .setCustomId('approve_' + label.toLowerCase().replace(/\s+/g, '_'))
+                            .setLabel(label)
+                            .setStyle(ButtonStyle.Success)
+                    );
+                }
+
+                const row = new ActionRowBuilder().addComponents(...allButtons);
                 logInteraction('APPROVAL', `Request sent to Discord: ${approval.message.substring(0, 50)}...`);
 
                 const reply = await originalMessage.reply({
@@ -2874,14 +2724,16 @@ async function monitorAIResponse(originalMessage, cdp) {
 
                 try {
                     const interaction = await reply.awaitMessageComponent({ filter: i => i.user.id === (originalMessage.author?.id || originalMessage.user?.id), time: 60000 });
-                    const allow = interaction.customId === 'approve_action';
+                    const allow = interaction.customId.startsWith('approve_');
+                    // クリックされたDiscordボタンのラベルを取得し、Antigravity側の対応ボタンをクリック
+                    const clickedLabel = interaction.component.label;
                     await interaction.deferUpdate();
-                    const clickResult = await clickApproval(cdp, allow);
-                    logInteraction('ACTION', `User ${allow ? 'Approved' : 'Rejected'} the request.`);
+                    const clickResult = await clickApproval(cdp, allow, clickedLabel);
+                    logInteraction('ACTION', `User clicked "${clickedLabel}" (${allow ? 'Approve' : 'Reject'}).`);
 
                     // Edit reply to show outcome
                     await reply.editReply({
-                        content: `**Action ${allow ? 'Approved' : 'Rejected'}:**\n${approval.message}`,
+                        content: `**${clickedLabel}:**\n${approval.message}`,
                         components: []
                     });
 
@@ -2921,8 +2773,7 @@ async function monitorAIResponse(originalMessage, cdp) {
                         logInteraction('ERROR', `getLastResponse failed: ${e?.message || String(e)}`);
                     }
                     if (!response?.text) {
-                        const debugStr = response?.domDebug ? JSON.stringify(response.domDebug) : 'no domDebug';
-                        logInteraction('ERROR', `AI response generation completed, but extraction returned empty text. domDebug: ${debugStr}`);
+                        logInteraction('ERROR', 'AI response generation completed, but extraction returned empty text.');
                         try {
                             await safeReplyTarget(
                                 originalMessage,
@@ -2934,23 +2785,10 @@ async function monitorAIResponse(originalMessage, cdp) {
                         }
                         return;
                     }
-                    if (isLowConfidenceResponse(response)) {
-                        logInteraction('ERROR', `Low-confidence extraction in monitor flow (selector=${response.selector || 'n/a'}, messageRoleCount=${response.messageRoleCount || 0}).`);
-                        try {
-                            await safeReplyTarget(
-                                originalMessage,
-                                { content: 'AI response completed, but extraction looked like IDE chrome content. Please use `/last_response` after focusing the chat window.' },
-                                { preferReply: true }
-                            );
-                        } catch (replyErr) {
-                            logInteraction('ERROR', `Failed to send low-confidence warning to Discord: ${replyErr?.message || String(replyErr)}`);
-                        }
-                        return;
-                    }
 
                     logInteraction(
                         'ACTION',
-                        `Extracted AI response (${response.text.length} chars, markdown=${String(response.markdown || '').length} chars, selector=${response.selector || 'n/a'}, ctx=${response.contextId ?? 'n/a'})`
+                        `Extracted AI response (${response.text.length} chars, rawLength=${response.rawLength || 0}, ctx=${response.contextId ?? 'n/a'})`
                     );
 
                     let sent = false;

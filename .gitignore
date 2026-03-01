@@ -17,6 +17,16 @@ tests/*.png
 dom_dump.json
 debug/
 
+# 診断・デバッグ用一時ファイル
+current_json.txt
+current_targets.txt
+diag_results.json
+full_json_targets.json
+targets.txt
+targets_new.txt
+url_dump.txt
+url_full_list.txt
+
 # Ignore local workspace outputs, but keep placeholder files
 workspace/**
 !workspace/.gitkeep

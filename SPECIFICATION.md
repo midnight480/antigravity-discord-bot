@@ -10,14 +10,14 @@ Antigravity自体にはAPIがないため、CDPを通じてDOM操作やJavaScrip
 ```mermaid
 graph LR
     User[Discord User] -- Command --> DiscordBot[Node.js Bot]
-    DiscordBot -- CDP (WebSocket) --> Antigravity["Antigravity (VS Code)"]
+    DiscordBot -- CDP WebSocket --> Antigravity["Antigravity (VS Code)"]
     Antigravity -- File System --> FileWatcher[Chokidar]
     FileWatcher -- Event --> DiscordBot
     DiscordBot -- Reply --> User
 ```
 
 ### 主要コンポーネント
-- **CDP (Chrome DevTools Protocol)**: AntigravityのWebView（iframe）内のDOMにアクセスし、ボタンクリックやテキスト取得を行います。
+- **CDP (Chrome DevTools Protocol)**: AntigravityのメインドキュメントのDOMにアクセスし、ボタンクリックやテキスト取得を行います。
 - **Chokidar**: ファイルシステムの変更を監視し、Antigravityが生成したファイルや変更を検知してDiscordに通知します。
 - **Discord.js**: Discord APIとの通信を行います。
 
@@ -28,36 +28,98 @@ graph LR
 - 入力欄のセレクター: `textarea[class*="input"]` など
 - 送信ボタンのクリックまたは `Enter` キーイベントの発火によって生成を開始します。
 
-### 3.2 モデル切替 (`/model`)
+### 3.2 AI応答の抽出
+生成完了後、`.antigravity-agent-side-panel` 内のメッセージコンテナからAIの回答テキストを抽出します。
+
+**抽出ロジック:**
+1. メッセージコンテナ（`.relative.flex.flex-col.gap-y-3.px-4`）の子ブロックを取得
+2. 下から走査し、最新のユーザー送信ブロック（`undo` ボタンを持つブロック）を特定
+3. ユーザーブロック以降のブロックをレスポンス対象として抽出（ユーザーが最後のブロックならそのブロック自体を含める）
+4. ノイズ除去: Thought/Ran command ヘッダー、style要素、Good/Badボタン、undo要素を除去
+5. **回答全文テキスト**: 下から最大4000文字
+6. **返信テキスト**: 下から最大1900文字
+
+**技術メモ:**
+- CDP式は `Function.toString()` + 文字列連結方式で生成（テンプレートリテラルのエスケープ問題を回避）
+- スクロール処理は廃止（表示範囲のテキストのみ取得）
+- iframe走査は廃止（チャットパネルはメインdocument上に存在）
+
+### 3.3 モデル切替 (`/model`)
 - AntigravityのUI上にあるモデル選択ドロップダウンを操作します。
 - **DOM操作**:
   1. `<button aria-expanded="false">` をクリックしてドロップダウンを展開。
   2. ドロップダウン内のモデル名リストを取得。
   3. 指定されたモデル名の要素をクリック。
-  - iframe内にあるため、全iframeを走査して対象要素を探します。
 
-### 3.3 モード切替 (`/mode`)
+### 3.4 モード切替 (`/mode`)
 - Planning Mode / Fast Mode の切替を行います。
 - **DOM操作**:
   1. モード切替トグルをクリック。
   2. ダイアログ内の "Planning" または "Fast" をクリック。
 
-### 3.4 チャットタイトル取得 (`/title`)
+### 3.5 チャットタイトル取得 (`/title`)
 - 現在のチャットセッションのタイトルを取得します。
-- **DOM操作**:
-  - `p.text-ide-sidebar-title-color` クラスを持つ要素を探し、そのテキストを取得します。
+- `p.text-ide-sidebar-title-color` クラスを持つ要素のテキストを取得します。
 
-### 3.5 ファイル監視
-- プロジェクトルート（デフォルトはボットの親ディレクトリ、環境変数 `WATCH_DIR` や起動時の対話設定で指定可能）以下のファイル変更を監視します。
+### 3.6 承認ボタン処理
+AIエージェントが実行許可を求める承認ダイアログを検出し、Discord経由で制御します。
+
+**承認キーワード（10種）:**
+```
+Run, Accept, Accept all, Allow, Always Allow,
+Keep Waiting, Continue, Allow Once, Allow This Conversation, Retry
+```
+
+**拒否キーワード:**
+```
+Reject, Cancel, Deny
+```
+
+**保護ロジック:**
+| 保護レイヤー | 内容 |
+|---|---|
+| **ドロップダウン除外** | `aria-haspopup="listbox"` を持つボタンをスキップ（「Always run」の誤認防止） |
+| **Safe Click** | 親コンテナ内に拒否ボタンが存在する場合のみ「本物の承認ダイアログ」と判定 |
+| **キーワードマッチ** | 完全一致 + スペース区切り前方一致（例: "run" ✅, "run command" ✅, "running" ❌） |
+
+**動的Discord ボタン:**
+- Antigravity側のボタンラベルをそのままDiscordボタンに反映
+- ユーザーがクリックしたDiscordボタンのラベルに対応するAntigravity側ボタンを正確にクリック
+
+### 3.7 Smart Safety（破壊的コマンドのブロック）
+自動承認モードでも以下の危険なコマンドパターンが検出された場合、自動承認をスキップしてDiscordに手動承認を要求します。
+
+**ブロック対象パターン（11種）:**
+```
+rm -rf /,  rm -rf ~,  rm -rf *,  format c:,  del /f /s /q,
+rmdir /s /q,  :(){:|:&};:,  dd if=,  mkfs.,  > /dev/sda,  chmod -R 777 /
+```
+
+### 3.8 ファイル監視
+- プロジェクトルート以下のファイル変更を監視します（環境変数 `WATCH_DIR` で指定可能）。
 - 除外ファイル: `node_modules`, `.git`, `.env`, ログファイルなど。
-- 新規作成 (`add`) または変更 (`change`) があった場合、そのファイルパスと内容（テキストファイルの場合）をDiscordに通知します。
+- 新規作成 (`add`) または変更 (`change`) があった場合、Discordに通知します。
 
-## 4. 環境設定
+## 4. セキュリティ
+
+### 起動時チェック
+- `DISCORD_ALLOWED_USER_ID` が未設定の場合、ボットは起動を拒否します（v1.3以降）。
+- エラーメッセージにDiscord User IDの取得手順を表示します。
+
+### アクセス制御
+- すべてのコマンドは `DISCORD_ALLOWED_USER_ID` に一致するユーザーからのみ受け付けます。
+- 不正なユーザーのメッセージは無視されます。
+
+## 5. 環境設定
 
 ### 必要な環境変数 (.env)
-- `DISCORD_BOT_TOKEN`: Discord Botのトークン
-- `DISCORD_ALLOWED_USER_ID`: 操作を許可するユーザーID（セキュリティのため制限）
-- `WATCH_DIR`: (任意) 監視対象のディレクトリパス。未指定の場合は起動時に対話的に設定を求められ、空欄でEnterを押すと監視機能が無効化されます。
+| 変数名 | 必須 | 説明 |
+|---|---|---|
+| `DISCORD_BOT_TOKEN` | ✅ | Discord Botのトークン |
+| `DISCORD_ALLOWED_USER_ID` | ✅ | 操作を許可するユーザーID |
+| `WATCH_DIR` | ❌ | 監視対象のディレクトリパス（未指定時は対話的に設定） |
+| `DISCORD_ACTIVITY_LOG` | ❌ | アクティビティログの出力先パス |
+| `DISCORD_TEST_CHANNEL_ID` | ❌ | テスト用チャンネルID |
 
 ### 依存関係
 - `discord.js`: ^14.x

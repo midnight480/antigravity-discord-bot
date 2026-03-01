@@ -1,22 +1,36 @@
 
 export const SELECTORS = {
-    // Chat Input: targeted by role and excluding terminal helpers
+    // チャット入力欄: ターミナルの入力欄を除外
     CHAT_INPUT: 'div[role="textbox"]:not(.xterm-helper-textarea)',
 
-    // Submit Button: Look for a button that likely submits, containing an arrow icon
-    // Using a broad selector for the button wrapper, then verifying SVG inside in JS
+    // 送信ボタン: SVG アイコンのクラス名で判定
     SUBMIT_BUTTON_CONTAINER: 'button',
     SUBMIT_BUTTON_SVG_CLASSES: ['lucide-arrow-right', 'lucide-arrow-up', 'lucide-send'],
 
-    // Approval Buttons
+    // 承認ボタンキーワード（10種のみ）
     APPROVAL_KEYWORDS: [
-        'run', 'approve', 'allow', 'yes', 'accept', 'confirm',
-        'save', 'apply', 'create', 'update', 'delete', 'remove', 'submit', 'send', 'retry', 'continue',
-        'always allow', 'allow once', 'allow this conversation',
-        '実行', '許可', '承認', 'はい', '同意', '保存', '適用', '作成', '更新', '削除', '送信', '再試行', '続行'
+        'run', 'accept', 'accept all', 'allow', 'always allow',
+        'keep waiting', 'continue', 'allow once', 'allow this conversation', 'retry'
     ],
-    CANCEL_KEYWORDS: ['cancel', 'reject', 'deny', 'ignore', 'キャンセル', '拒否', '無視', 'いいえ', '不許可'],
+    // 拒否ボタンキーワード
+    CANCEL_KEYWORDS: ['reject', 'cancel', 'deny'],
 
-    // Context
+    // 破壊的コマンドパターン（Smart Safety）
+    // 自動承認モードでもこれらが含まれる場合はDiscord手動承認を要求する
+    DANGEROUS_COMMANDS: [
+        'rm -rf /',
+        'rm -rf ~',
+        'rm -rf *',
+        'format c:',
+        'del /f /s /q',
+        'rmdir /s /q',
+        ':(){:|:&};:',
+        'dd if=',
+        'mkfs.',
+        '> /dev/sda',
+        'chmod -R 777 /'
+    ],
+
+    // コンテキスト判定用URLキーワード
     CONTEXT_URL_KEYWORD: 'cascade-panel'
 };
