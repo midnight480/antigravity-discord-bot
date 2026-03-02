@@ -64,11 +64,15 @@ graph LR
 ### 3.6 承認ボタン処理
 AIエージェントが実行許可を求める承認ダイアログを検出し、Discord経由で制御します。
 
-**承認キーワード（10種）:**
-```
+**承認キーワード（11種）:**
+```text
 Run, Accept, Accept all, Allow, Always Allow,
-Keep Waiting, Continue, Allow Once, Allow This Conversation, Retry
+Keep Waiting, Continue, Allow Once, Allow This Conversation, Retry, allow access
 ```
+
+**抽出・クリックロジックの強化 (v1.4.0):**
+- **Shadow DOM 対応**: メインのDOMだけでなく、Shadow DOM内部の要素も再帰的に走査し、隠れた承認ボタンを検出します。
+- **全ターゲット横断スキャン**: 複数のターゲット（ページやワーカー）が存在する場合でも、全ターゲットを横断してスキャンを行い、承認ボタンのあるターゲット（`targetUrl`）を特定して接続し、クリック処理を確実に行います。
 
 **拒否キーワード:**
 ```
