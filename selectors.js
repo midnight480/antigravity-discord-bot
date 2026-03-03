@@ -10,7 +10,8 @@ export const SELECTORS = {
     // 承認ボタンキーワード（10種のみ）
     APPROVAL_KEYWORDS: [
         'run', 'accept', 'accept all', 'allow', 'always allow',
-        'keep waiting', 'continue', 'allow once', 'allow this conversation', 'retry'
+        'keep waiting', 'continue', 'allow once', 'allow this conversation', 'retry',
+        'allow access'
     ],
     // 拒否ボタンキーワード
     CANCEL_KEYWORDS: ['reject', 'cancel', 'deny'],

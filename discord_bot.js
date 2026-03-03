@@ -1170,12 +1170,12 @@ async function discoverCDP() {
             await new Promise((resolve, reject) => {
                 ws.on('open', resolve);
                 ws.on('error', reject);
-                setTimeout(() => reject(new Error('probe timeout')), 5000);
+                setTimeout(() => reject(new Error('probe timeout')), 1000); // reduced from 5000
             });
             let msgId = 1;
             const call = (method, params) => new Promise((resolve, reject) => {
                 const id = msgId++;
-                const timeoutId = setTimeout(() => reject(new Error('call timeout')), 5000);
+                const timeoutId = setTimeout(() => reject(new Error('call timeout')), 1000); // reduced from 5000
                 const handler = (msg) => {
                     try {
                         const d = JSON.parse(msg);
@@ -1320,7 +1320,8 @@ async function listAllCDPTargets() {
     return allTargets;
 }
 
-async function connectCDP(url) {
+async function connectCDP(url, options = {}) {
+    const silent = options.silent || false;
     const ws = new WebSocket(url);
     await new Promise((resolve, reject) => {
         ws.on('open', resolve);
@@ -1357,18 +1358,15 @@ async function connectCDP(url) {
     });
 
     ws.on('close', () => {
-        logInteraction('CDP', 'WebSocket disconnected.');
+        if (!silent) logInteraction('CDP', 'WebSocket disconnected.');
         if (cdpConnection && cdpConnection.ws === ws) {
             cdpConnection = null;
         }
     });
 
     await call("Runtime.enable", {});
-    await call("Runtime.disable", {}); // Toggle to force re-emission of events
-    await call("Runtime.enable", {});
-    await new Promise(r => setTimeout(r, 1000)); // Wait for context events
     console.log(`[CDP] Initialized with ${contexts.length} contexts.`);
-    logInteraction('CDP', `Connected to target: ${url}`);
+    if (!silent) logInteraction('CDP', `Connected to target: ${url}`);
     return { ws, call, contexts };
 }
 
@@ -1827,7 +1825,10 @@ async function checkApprovalRequired(preferredCdp = null) {
             });
         }
 
-        const buttons = getAllInteractiveElements(document.body || document);
+        // antigravity-agent-side-panel 内のみを探索（VS Code本体のボタン誤検出を防止）
+        const panel = document.querySelector('.antigravity-agent-side-panel');
+        if (!panel) return null;
+        const buttons = getAllInteractiveElements(panel);
         for (const btn of buttons) {
             if (btn.offsetWidth === 0 || btn.offsetHeight === 0) continue;
             if (btn.getAttribute('aria-haspopup') === 'listbox') continue;
@@ -1885,7 +1886,7 @@ async function checkApprovalRequired(preferredCdp = null) {
             if (preferredCdp && url === preferredCdp.ws.url) {
                 tempCdp = preferredCdp;
             } else {
-                tempCdp = await connectCDP(url);
+                tempCdp = await connectCDP(url, { silent: true });
             }
 
             for (const ctx of tempCdp.contexts) {
@@ -1918,7 +1919,7 @@ async function clickApproval(preferredCdp, allow, targetLabel = null, targetUrl 
 
     if (targetUrl && (!preferredCdp || preferredCdp.ws.url !== targetUrl)) {
         try {
-            activeCdp = await connectCDP(targetUrl);
+            activeCdp = await connectCDP(targetUrl, { silent: true });
             needsClose = true;
         } catch (e) {
             logInteraction('ERROR', '[CLICK_APPROVAL] failed to connect to ' + targetUrl + ': ' + e.message);
@@ -1967,7 +1968,10 @@ async function clickApproval(preferredCdp, allow, targetLabel = null, targetUrl 
             });
         }
 
-        const buttons = getAllInteractiveElements(document.body || document);
+        // antigravity-agent-side-panel 内のみを探索（VS Code本体のボタン誤検出を防止）
+        const panel = document.querySelector('.antigravity-agent-side-panel');
+        if (!panel) return { success: false, log: ['panel not found'] };
+        const buttons = getAllInteractiveElements(panel);
         for (const btn of buttons) {
             if (btn.offsetWidth === 0 || btn.offsetHeight === 0) continue;
             if (btn.getAttribute('aria-haspopup') === 'listbox') continue;
@@ -2411,35 +2415,16 @@ async function startNewChat(cdp) {
 
 async function getCurrentModel(cdp) {
     const EXP = `(() => {
-            const docs = [document];
-            const iframes = document.querySelectorAll('iframe');
-            for (let i = 0; i < iframes.length; i++) {
-                try { if (iframes[i].contentDocument) docs.push(iframes[i].contentDocument); } catch (e) { }
+        const panels = document.querySelectorAll('.antigravity-agent-side-panel');
+        for (const panel of panels) {
+            const span = panel.querySelector('span.min-w-0.select-none.overflow-hidden.text-ellipsis.whitespace-nowrap.text-xs.opacity-70');
+            if (span) {
+                const txt = span.innerText.trim();
+                if (txt && !txt.includes('Planning') && !txt.includes('Fast')) return txt;
             }
-            for (const doc of docs) {
-                const buttons = Array.from(doc.querySelectorAll('button, div[role="button"]'));
-                for (const btn of buttons) {
-                    const txt = (btn.textContent || '').trim();
-                    const lower = txt.toLowerCase();
-
-                    // If the button has aria-expanded, it is highly likely the model selector or mode selector
-                    if (btn.hasAttribute('aria-expanded')) {
-                        if (lower.includes('claude') || lower.includes('gemini') || lower.includes('gpt') || lower.includes('o1') || lower.includes('o3') || lower.includes('model')) {
-                            return txt;
-                        }
-                    }
-
-                    // Sometimes it's just a button with text
-                    if (txt.length > 3 && txt.length < 50 && (lower.includes('claude') || lower.includes('gemini') || lower.includes('gpt'))) {
-                        // Make sure it looks like a selected model button (often has an SVG caret next to it)
-                        if (btn.querySelector('svg')) {
-                            return txt;
-                        }
-                    }
-                }
-            }
-            return null;
-        })()`;
+        }
+        return null;
+    })()`;
     for (const ctx of cdp.contexts) {
         try {
             const res = await cdp.call("Runtime.evaluate", { expression: EXP, returnByValue: true, contextId: ctx.id });
@@ -2457,10 +2442,13 @@ async function getCurrentTitle(cdp) {
                 try { if (iframes[i].contentDocument) docs.push(iframes[i].contentDocument); } catch (e) { }
             }
             for (const doc of docs) {
-                const els = doc.querySelectorAll('p.text-ide-sidebar-title-color');
-                for (const el of els) {
-                    const txt = (el.innerText || '').trim();
-                    if (txt.length > 1) return txt;
+                const panels = doc.querySelectorAll('.antigravity-agent-side-panel');
+                for (const panel of panels) {
+                    const titleDiv = panel.querySelector('div.flex.min-w-0.items-center.overflow-hidden.text-ellipsis.whitespace-nowrap.gap-1');
+                    if (titleDiv) {
+                        const txt = (titleDiv.innerText || '').trim();
+                        if (txt.length > 1) return txt;
+                    }
                 }
             }
             return null;
@@ -2476,49 +2464,49 @@ async function getCurrentTitle(cdp) {
 
 async function getModelList(cdp) {
     const EXP = `(async () => {
-            const docs = [document];
-            const iframes = document.querySelectorAll('iframe');
-            for (let i = 0; i < iframes.length; i++) {
-                try { if (iframes[i].contentDocument) docs.push(iframes[i].contentDocument); } catch (e) { }
-            }
-            let targetDoc = null;
-            for (const doc of docs) {
-                const buttons = Array.from(doc.querySelectorAll('button, div[role="button"]'));
+            const panels = document.querySelectorAll('.antigravity-agent-side-panel');
+            let targetPanel = null;
+            let targetBtn = null;
+            
+            for (const panel of panels) {
+                // Find a button that looks like the model selector
+                const buttons = panel.querySelectorAll('button, div[role="button"]');
                 for (const btn of buttons) {
                     const txt = (btn.textContent || '').trim();
                     const lower = txt.toLowerCase();
                     if (btn.hasAttribute('aria-expanded')) {
                         if (lower.includes('claude') || lower.includes('gemini') || lower.includes('gpt') || lower.includes('o1') || lower.includes('o3') || lower.includes('model')) {
-                            btn.click();
-                            targetDoc = doc;
-                            break;
-                        }
-                    }
-                    if (!targetDoc && txt.length > 3 && txt.length < 50 && (lower.includes('claude') || lower.includes('gemini') || lower.includes('gpt'))) {
-                        if (btn.querySelector('svg')) {
-                            btn.click();
-                            targetDoc = doc;
+                            targetBtn = btn;
+                            targetPanel = panel;
                             break;
                         }
                     }
                 }
-                if (targetDoc) break;
+                if (targetBtn) break;
             }
-            if (!targetDoc) return JSON.stringify([]);
+            
+            if (!targetBtn) return JSON.stringify([]);
+            targetBtn.click();
             await new Promise(r => setTimeout(r, 1000));
 
             let models = [];
-            const options = Array.from(targetDoc.querySelectorAll('div.cursor-pointer'));
+            // Assuming the dropdown is rendered either near the button or at the end of the body, but usually we can find it by class
+            const options = Array.from(document.querySelectorAll('.border-gray-500\\\\/20 .cursor-pointer'));
             for (const opt of options) {
-                if (opt.className.includes('px-') || opt.className.includes('py-')) {
-                    const txt = (opt.textContent || '').replace('New', '').trim();
-                    if (txt.length > 3 && txt.length < 50 && (txt.toLowerCase().includes('claude') || txt.toLowerCase().includes('gemini') || txt.toLowerCase().includes('gpt') || txt.toLowerCase().includes('o1') || txt.toLowerCase().includes('o3'))) {
-                        if (!models.includes(txt)) models.push(txt);
+                const txt = (opt.textContent || '').replace('New', '').trim();
+                const lower = txt.toLowerCase();
+                if (txt.length > 3 && txt.length < 50 && (lower.includes('claude') || lower.includes('gemini') || lower.includes('gpt') || lower.includes('o1') || lower.includes('o3'))) {
+                    // Extract model name from span
+                    const span = opt.querySelector('span.text-xs.font-medium');
+                    if (span) {
+                       const modelName = span.innerText.trim();
+                       if (modelName && !models.includes(modelName)) models.push(modelName);
                     }
                 }
             }
 
-            const openBtn = targetDoc.querySelector('button[aria-expanded="true"], div[role="button"][aria-expanded="true"]');
+            // Close the dropdown
+            const openBtn = document.querySelector('button[aria-expanded="true"], div[role="button"][aria-expanded="true"]');
             if (openBtn) openBtn.click();
 
             return JSON.stringify(models);
@@ -2538,54 +2526,48 @@ async function getModelList(cdp) {
 
 async function switchModel(cdp, targetName) {
     const SWITCH_EXP = `(async () => {
-            const docs = [document];
-            const iframes = document.querySelectorAll('iframe');
-            for (let i = 0; i < iframes.length; i++) {
-                try { if (iframes[i].contentDocument) docs.push(iframes[i].contentDocument); } catch (e) { }
-            }
-            let targetDoc = null;
-            for (const doc of docs) {
-                const buttons = Array.from(doc.querySelectorAll('button, div[role="button"]'));
+            const panels = document.querySelectorAll('.antigravity-agent-side-panel');
+            let targetPanel = null;
+            let targetBtn = null;
+            
+            for (const panel of panels) {
+                // Find a button that looks like the model selector
+                const buttons = panel.querySelectorAll('button, div[role="button"]');
                 for (const btn of buttons) {
                     const txt = (btn.textContent || '').trim();
                     const lower = txt.toLowerCase();
                     if (btn.hasAttribute('aria-expanded')) {
                         if (lower.includes('claude') || lower.includes('gemini') || lower.includes('gpt') || lower.includes('o1') || lower.includes('o3') || lower.includes('model')) {
-                            btn.click();
-                            targetDoc = doc;
-                            break;
-                        }
-                    }
-                    if (!targetDoc && txt.length > 3 && txt.length < 50 && (lower.includes('claude') || lower.includes('gemini') || lower.includes('gpt'))) {
-                        if (btn.querySelector('svg')) {
-                            btn.click();
-                            targetDoc = doc;
+                            targetBtn = btn;
+                            targetPanel = panel;
                             break;
                         }
                     }
                 }
-                if (targetDoc) break;
+                if (targetBtn) break;
             }
-            if (!targetDoc) return JSON.stringify({ success: false, reason: 'button not found' });
+            
+            if (!targetBtn) return JSON.stringify({ success: false, reason: 'button not found' });
+            targetBtn.click();
             await new Promise(r => setTimeout(r, 1000));
 
-            const target = ${JSON.stringify(targetName)
-        }.toLowerCase();
-        const options = Array.from(targetDoc.querySelectorAll('div.cursor-pointer'));
-        for (const opt of options) {
-            if (opt.className.includes('px-') || opt.className.includes('py-')) {
-                const txt = (opt.textContent || '').replace('New', '').trim();
-                if (txt.toLowerCase().includes(target)) {
-                    opt.click();
-                    return JSON.stringify({ success: true, model: txt });
+            const target = ${JSON.stringify(targetName)}.toLowerCase();
+            const options = Array.from(document.querySelectorAll('.border-gray-500\\\\/20 .cursor-pointer'));
+            for (const opt of options) {
+                const span = opt.querySelector('span.text-xs.font-medium');
+                if (span) {
+                    const txt = span.innerText.trim();
+                    if (txt.toLowerCase().includes(target)) {
+                        opt.click();
+                        return JSON.stringify({ success: true, model: txt });
+                    }
                 }
             }
-        }
 
-        const openBtn = targetDoc.querySelector('button[aria-expanded="true"], div[role="button"][aria-expanded="true"]');
-        if (openBtn) openBtn.click();
-        return JSON.stringify({ success: false, reason: 'model not found in options list' });
-    }) ()`;
+            const openBtn = document.querySelector('button[aria-expanded="true"], div[role="button"][aria-expanded="true"]');
+            if (openBtn) openBtn.click();
+            return JSON.stringify({ success: false, reason: 'model not found in options list' });
+    })()`;
 
     for (const ctx of cdp.contexts) {
         try {
@@ -2605,20 +2587,13 @@ async function switchModel(cdp, targetName) {
 
 async function getCurrentMode(cdp) {
     const EXP = `(() => {
-        function getTargetDoc() {
-            const iframes = document.querySelectorAll('iframe');
-            for (let i = 0; i < iframes.length; i++) {
-                if (iframes[i].src.includes('cascade-panel')) {
-                    try { return iframes[i].contentDocument; } catch (e) { }
-                }
+        const panels = document.querySelectorAll('.antigravity-agent-side-panel');
+        for (const panel of panels) {
+            const spans = panel.querySelectorAll('span.text-xs.select-none');
+            for (const s of spans) {
+                const txt = (s.innerText || '').trim();
+                if (txt === 'Planning' || txt === 'Fast') return txt;
             }
-            return document;
-        }
-        const doc = getTargetDoc();
-        const spans = doc.querySelectorAll('span.text-xs.select-none');
-        for (const s of spans) {
-            const txt = (s.innerText || '').trim();
-            if (txt === 'Planning' || txt === 'Fast') return txt;
         }
         return null;
     })()`;
@@ -2633,45 +2608,47 @@ async function getCurrentMode(cdp) {
 
 async function switchMode(cdp, targetMode) {
     const SWITCH_EXP = `(async () => {
-        function getTargetDoc() {
-            const iframes = document.querySelectorAll('iframe');
-            for (let i = 0; i < iframes.length; i++) {
-                if (iframes[i].src.includes('cascade-panel')) {
-                    try { return iframes[i].contentDocument; } catch (e) { }
+        const panels = document.querySelectorAll('.antigravity-agent-side-panel');
+        let targetPanel = null;
+        let targetBtn = null;
+        
+        for (const panel of panels) {
+            const toggles = panel.querySelectorAll('div[role="button"][aria-haspopup="dialog"]');
+            for (const t of toggles) {
+                const txt = (t.innerText || '').trim();
+                if (txt === 'Planning' || txt === 'Fast') {
+                    targetBtn = t.querySelector('button') || t; // sometimes the click is on the inner button
+                    targetPanel = panel;
+                    break;
                 }
             }
-            return document;
+            if (targetBtn) break;
         }
-        const doc = getTargetDoc();
-        const toggles = doc.querySelectorAll('div[role="button"][aria-haspopup="dialog"]');
-        let clicked = false;
-        for (const t of toggles) {
-            const txt = (t.innerText || '').trim();
-            if (txt === 'Planning' || txt === 'Fast') {
-                t.querySelector('button').click();
-                clicked = true;
-                break;
-            }
-        }
-        if (!clicked) return JSON.stringify({ success: false, reason: 'toggle not found' });
+
+        if (!targetBtn) return JSON.stringify({ success: false, reason: 'mode toggle button not found' });
+        
+        targetBtn.click();
         await new Promise(r => setTimeout(r, 1000));
-        const target = ${JSON.stringify(targetMode)
-        };
-    const dialogs = doc.querySelectorAll('div[role="dialog"]');
-    for (const dialog of dialogs) {
-        const txt = (dialog.innerText || '');
-        if (txt.includes('Conversation mode') || txt.includes('Planning') && txt.includes('Fast')) {
-            const divs = dialog.querySelectorAll('div.font-medium');
-            for (const d of divs) {
-                if (d.innerText.trim().toLowerCase() === target.toLowerCase()) {
-                    d.click();
-                    return JSON.stringify({ success: true, mode: d.innerText.trim() });
+        
+        const targetStr = ${JSON.stringify(targetMode)}.toLowerCase() === 'fast' ? 'Fast' : 'Planning';
+        
+        // Find the options in the opened dialog
+        const dialogs = document.querySelectorAll('div[role="dialog"]');
+        for (const dialog of dialogs) {
+            const txt = (dialog.innerText || '');
+            if (txt.includes('Conversation mode') || (txt.includes('Planning') && txt.includes('Fast'))) {
+                const divs = dialog.querySelectorAll('div.font-medium');
+                for (const d of divs) {
+                    if (d.innerText.trim().toLowerCase() === targetStr.toLowerCase()) {
+                        d.click();
+                        return JSON.stringify({ success: true, mode: d.innerText.trim() });
+                    }
                 }
             }
         }
-    }
-    return JSON.stringify({ success: false, reason: 'mode not found in dialog' });
-}) ()`;
+        
+        return JSON.stringify({ success: false, reason: 'mode option not found in dropdown' });
+    })()`;
 
     for (const ctx of cdp.contexts) {
         try {
@@ -2863,7 +2840,7 @@ async function monitorAIResponse(originalMessage, cdp) {
                     logInteraction('ACTION', `User clicked "${clickedLabel}" (${allow ? 'Approve' : 'Reject'}).`);
 
                     // Edit reply to show outcome
-                    await reply.editReply({
+                    await reply.edit({
                         content: `**${clickedLabel}:**\n${approval.message}`,
                         components: []
                     });
@@ -2972,23 +2949,18 @@ const commands = [
         description: 'Start a new chat',
     },
     {
-        name: 'title',
-        description: 'Show current chat title',
-    },
-
-    {
         name: 'last_response',
         description: 'Extract latest response and save local raw dump',
     },
     {
         name: 'model',
-        description: 'List models or switch model',
+        description: 'Switch model (leave empty to list available models)',
         options: [
             {
-                name: 'target',
-                description: 'Type "list" to show models, or a number to switch',
-                type: 3, // STRING
-                required: true,
+                name: 'number',
+                description: 'Model number to switch to',
+                type: 4, // INTEGER
+                required: false,
             }
         ]
     },
@@ -3033,18 +3005,14 @@ const commands = [
         description: 'Show available commands and usage instructions',
     },
     {
-        name: 'list_windows',
-        description: 'List available Antigravity windows',
-    },
-    {
-        name: 'select_window',
-        description: 'Select active window by number',
+        name: 'window',
+        description: 'Manage Antigravity windows (leave number empty to list available windows)',
         options: [
             {
                 name: 'number',
-                description: 'Window number',
-                type: 4,
-                required: true,
+                description: 'Window number to select',
+                type: 4, // INTEGER
+                required: false,
             }
         ]
     }
@@ -3057,23 +3025,36 @@ client.on('error', error => {
 
 client.once('clientReady', async () => {
     console.log(`Logged in as ${client.user.tag}`);
+    console.log('起動処理中...（数十秒かかる場合があります）');
+
     setupFileWatcher();
 
-    const startupCdp = await ensureCDP();
-    if (startupCdp) console.log('Auto-connected to Antigravity on startup.');
-    else console.log('Could not auto-connect to Antigravity on startup.');
+    // CDP接続とスラッシュコマンド登録を並行実行
+    const cdpPromise = ensureCDP();
+    const commandsPromise = (async () => {
+        try {
+            console.log('Started refreshing application (/) commands.');
+            const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
+            await rest.put(
+                Routes.applicationCommands(client.user.id),
+                { body: commands },
+            );
+            console.log('Successfully reloaded application (/) commands.');
+        } catch (error) {
+            console.error('Failed to reload application commands:', error);
+        }
+    })();
 
-    try {
-        console.log('Started refreshing application (/) commands.');
-        const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
-        await rest.put(
-            Routes.applicationCommands(client.user.id),
-            { body: commands },
-        );
-        console.log('Successfully reloaded application (/) commands.');
-    } catch (error) {
-        console.error('Failed to reload application commands:', error);
+    const [cdpResult] = await Promise.allSettled([cdpPromise, commandsPromise]);
+    const startupCdp = cdpResult.status === 'fulfilled' ? cdpResult.value : null;
+
+    if (startupCdp) {
+        console.log('Auto-connected to Antigravity on startup.');
+    } else {
+        console.log('Could not auto-connect to Antigravity on startup.');
     }
+
+    console.log('起動完了');
 
     if (RUN_STARTUP_TEST) {
         console.log('[TEST] Startup test mode enabled (--test).');
@@ -3117,26 +3098,25 @@ client.on('interactionCreate', async interaction => {
 
         await interaction.deferReply();
 
-        if (commandName === 'list_windows') {
-            const targets = await listAllCDPTargets();
-            if (targets.length === 0) {
-                await interaction.editReply('No available windows found.');
-                return;
-            }
-
-            const selected = explicitTargetUrl;
-            const list = targets.map((t, i) => {
-                const isSelected = selected === t.webSocketDebuggerUrl;
-                return `${isSelected ? '>' : ' '} ${i + 1}. ${t.title} (port ${t.port})`;
-            }).join('\n');
-
-            await interaction.editReply(`Available windows:\n\n${list}\n\nUse /select_window number:<n> to select one.`);
-            return;
-        }
-
-        if (commandName === 'select_window') {
+        if (commandName === 'window') {
             const num = interaction.options.getInteger('number');
             const targets = await listAllCDPTargets();
+
+            if (num === null) {
+                if (targets.length === 0) {
+                    await interaction.editReply('No available windows found.');
+                    return;
+                }
+
+                const selected = explicitTargetUrl;
+                const list = targets.map((t, i) => {
+                    const isSelected = selected === t.webSocketDebuggerUrl;
+                    return `${isSelected ? '>' : ' '} ${i + 1}. ${t.title} (port ${t.port})`;
+                }).join('\n');
+
+                await interaction.editReply(`Available windows:\n\n${list}\n\nUse /window number:<n> to select one.`);
+                return;
+            }
 
             if (num < 1 || num > targets.length) {
                 await interaction.editReply(`Number must be between 1 and ${targets.length}.`);
@@ -3203,11 +3183,7 @@ client.on('interactionCreate', async interaction => {
             return;
         }
 
-        if (commandName === 'title') {
-            const title = await getCurrentTitle(cdp);
-            await interaction.editReply(`Current chat title: ${title || 'unknown'}`);
-            return;
-        }
+
 
 
 
@@ -3245,9 +3221,9 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (commandName === 'model') {
-            const target = interaction.options.getString('target');
+            const num = interaction.options.getInteger('number');
 
-            if (target.toLowerCase() === 'list') {
+            if (num === null) {
                 const current = await getCurrentModel(cdp);
                 const models = await getModelList(cdp);
                 if (models.length === 0) {
@@ -3255,13 +3231,12 @@ client.on('interactionCreate', async interaction => {
                     return;
                 }
                 const list = models.map((m, i) => `${m === current ? '>' : ' '} ${i + 1}. ${m}`).join('\n');
-                await interaction.editReply(`Current model: ${current || 'unknown'}\n\n${list}\n\nUse /model target:<n> to switch.`);
+                await interaction.editReply(`Current model: ${current || 'unknown'}\n\n${list}\n\nUse /model number:<n> to switch.`);
                 return;
             }
 
-            const num = parseInt(target, 10);
-            if (isNaN(num) || num < 1) {
-                await interaction.editReply('Target must be "list" or a valid number >= 1.');
+            if (num < 1) {
+                await interaction.editReply('Number must be >= 1.');
                 return;
             }
             const models = await getModelList(cdp);
@@ -3304,10 +3279,25 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (commandName === 'status') {
+            const title = await getCurrentTitle(cdp);
+            const model = await getCurrentModel(cdp);
             const mode = await getCurrentMode(cdp);
+
+            // Get current window info
+            let currentWindowStr = 'unknown';
+            try {
+                const targets = await listAllCDPTargets();
+                const activeTarget = targets.find(t => t.webSocketDebuggerUrl === explicitTargetUrl) || targets[0];
+                if (activeTarget) {
+                    currentWindowStr = activeTarget.title || 'unnamed window';
+                }
+            } catch (e) {
+                console.error('Failed to get current window for status:', e);
+            }
+
             const modeStr = mode || 'unknown';
             const autoStr = autoApproveMode ? 'ON' : 'OFF';
-            await interaction.editReply(`**Antigravity Status**\n- Mode: \`${modeStr}\`\n- Auto-approval: \`${autoStr}\``);
+            await interaction.editReply(`**Antigravity Status**\n- Title: \`${title || 'unknown'}\`\n- Model: \`${model || 'unknown'}\`\n- Mode: \`${modeStr}\`\n- Auto-approval: \`${autoStr}\`\n- Window: \`${currentWindowStr}\``);
             return;
         }
 
@@ -3316,25 +3306,27 @@ client.on('interactionCreate', async interaction => {
 **Antigravity Discord Bot Commands**
 
 **/status**
-Check the current Antigravity mode (planning/fast) and whether auto-approval is ON or OFF.
+Check the current Antigravity title, model, mode, and auto-approval state.
 
 **/auto [on|off]**
 Manage auto-approval mode for \`Run\` and \`Allow Once\` actions.
 - \`/auto on\`: Enables auto-approval.
 - \`/auto off\`: Disables auto-approval.
 
-**/model [target]**
+**/model [list|number]**
 Switch the AI model (e.g., GPT-4, Claude 3).
-- \`/model target:list\`: Lists available models.
-- \`/model target:1\`: Selects model #1 from the list.
+- \`/model\`: Lists available models.
+- \`/model number:1\`: Selects model #1 from the list.
 
 **/conversation [planning|fast]**
 Switch the agent's operating mode.
 - \`/conversation planning\`: Switches to Planning mode (waits for approval).
 - \`/conversation fast\`: Switches to Fast mode (acts immediately).
 
-**/list_windows** & **/select_window [number]**
+**/window [number]**
 Manage which VSCode/IDE window to connect to via CDP.
+- \`/window\`: Lists available windows.
+- \`/window number:1\`: Selects window #1 from the list.
 `;
             await interaction.editReply(helpText.trim());
             return;
