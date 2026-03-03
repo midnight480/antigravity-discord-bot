@@ -1778,56 +1778,87 @@ async function waitForGenerationStart(cdp, timeoutMs = 8000) {
     return false;
 }
 
-async function checkApprovalRequired(cdp) {
-    // メイン document から承認ダイアログのボタンを探す
-    // Safe Click: 親コンテナ内に拒否ボタン（Reject等）が存在する場合のみ本物と判定
+async function checkApprovalRequired(preferredCdp = null) {
+    // 全ターゲットをスキャンして承認ダイアログを探す（現在のCDP接続だけに依存しない）
+    let targets = [];
+    try {
+        const res = await fetch(`http://127.0.0.1:9222/json/list`);
+        targets = await res.json();
+    } catch (e) {
+        logInteraction('ERROR', '[CHECK_APPROVAL] failed to fetch targets: ' + e.message);
+        if (preferredCdp) targets = [{ webSocketDebuggerUrl: preferredCdp.ws.url, title: 'current' }];
+        else return null;
+    }
+
     const EXP = `(() => {
         const SELECTORS = ${JSON.stringify(SELECTORS)};
 
+        function getAllInteractiveElements(root) {
+            let els = Array.from(root.querySelectorAll('button, [role="button"], a[role="button"]'));
+            const all = root.querySelectorAll('*');
+            for (const el of all) {
+                if (el.shadowRoot) {
+                    els = els.concat(getAllInteractiveElements(el.shadowRoot));
+                }
+            }
+            return els;
+        }
+
         function getButtonText(btn) {
             const span = btn.querySelector('span.truncate');
-            return span ? (span.textContent || '').trim().toLowerCase() : '';
+            if (span) return (span.textContent || '').trim().toLowerCase();
+            const raw = (btn.innerText || btn.textContent || '').trim();
+            return raw.split('\\n')[0].trim().toLowerCase();
         }
 
         function isApproveButton(text) {
-            return SELECTORS.APPROVAL_KEYWORDS.some(kw => text === kw || text.startsWith(kw + ' '));
+            if (!text) return false;
+            return SELECTORS.APPROVAL_KEYWORDS.some(kw => {
+                const lkw = kw.toLowerCase();
+                return text === lkw || text.startsWith(lkw + ' ') || text.includes(lkw);
+            });
         }
 
         function isRejectButton(text) {
-            return SELECTORS.CANCEL_KEYWORDS.some(kw => text === kw || text.startsWith(kw + ' '));
+            if (!text) return false;
+            return SELECTORS.CANCEL_KEYWORDS.some(kw => {
+                const lkw = kw.toLowerCase();
+                return text === lkw || text.startsWith(lkw + ' ') || text.includes(lkw);
+            });
         }
 
-        const buttons = Array.from(document.querySelectorAll('button'));
+        const buttons = getAllInteractiveElements(document.body || document);
         for (const btn of buttons) {
-            // 非表示ボタンを除外
             if (btn.offsetWidth === 0 || btn.offsetHeight === 0) continue;
-            // ドロップダウンボタンを除外（"Always run" 等の誤認防止）
             if (btn.getAttribute('aria-haspopup') === 'listbox') continue;
 
             const text = getButtonText(btn);
             if (!text || !isApproveButton(text)) continue;
 
-            // Safe Click: 親コンテナ内に拒否ボタンが存在するか検証
-            // 3ボタン構成（例: Reject / Run / Always Allow）にも対応
-            const container = btn.parentElement;
+            let container = btn.parentElement;
+            let siblings = [];
+            for (let level = 0; level < 4 && container; level++) {
+                siblings = getAllInteractiveElements(container)
+                    .filter(s => s.offsetWidth > 0 && s.offsetHeight > 0 && s.getAttribute('aria-haspopup') !== 'listbox');
+                if (siblings.length > 1) break;
+                container = container.parentElement;
+            }
             if (!container) continue;
-            const siblings = Array.from(container.querySelectorAll('button'))
-                .filter(s => s.offsetWidth > 0 && s.offsetHeight > 0 && s.getAttribute('aria-haspopup') !== 'listbox');
 
-            // 全兄弟ボタンのラベルを収集
             const approveLabels = [];
             const rejectLabels = [];
             for (const s of siblings) {
                 const st = getButtonText(s);
                 if (!st) continue;
-                // 元のテキストの大文字小文字を保持するため、span から直接取得
-                const originalText = (s.querySelector('span.truncate')?.textContent || '').trim();
-                if (isApproveButton(st)) approveLabels.push(originalText);
-                if (isRejectButton(st)) rejectLabels.push(originalText);
+                const spanEl = s.querySelector('span.truncate');
+                const originalText = spanEl ? (spanEl.textContent || '').trim()
+                    : (s.innerText || s.textContent || '').trim().split('\\n')[0].trim();
+                if (!originalText) continue;
+                if (isApproveButton(st) && !approveLabels.includes(originalText)) approveLabels.push(originalText);
+                if (isRejectButton(st) && !rejectLabels.includes(originalText)) rejectLabels.push(originalText);
             }
             if (rejectLabels.length === 0) continue;
 
-            // 文脈テキスト取得（ボタンの祖先要素から）
             let contextText = 'Action requires approval.';
             let ancestor = btn;
             for (let i = 0; i < 5 && ancestor.parentElement; i++) ancestor = ancestor.parentElement;
@@ -1841,39 +1872,102 @@ async function checkApprovalRequired(cdp) {
         return null;
     })()`;
 
-    for (const ctx of cdp.contexts) {
+    for (const t of targets) {
+        const url = t.webSocketDebuggerUrl;
+        if (!url) continue;
+        // workbench系または preferredCdp のURLのみチェック
+        const isWorkbench = t.title?.toLowerCase().includes('antigravity') || t.url?.includes('workbench');
+        if (!isWorkbench && (!preferredCdp || url !== preferredCdp.ws.url)) continue;
+
+        let tempCdp = null;
         try {
-            const res = await cdp.call("Runtime.evaluate", { expression: EXP, returnByValue: true, contextId: ctx.id });
-            if (res.result?.value?.required) return res.result.value;
-        } catch (e) { }
+            // preferredCdp と同じURLならそれを使う、そうでなければ一時的に接続
+            if (preferredCdp && url === preferredCdp.ws.url) {
+                tempCdp = preferredCdp;
+            } else {
+                tempCdp = await connectCDP(url);
+            }
+
+            for (const ctx of tempCdp.contexts) {
+                const res = await tempCdp.call("Runtime.evaluate", { expression: EXP, returnByValue: true, contextId: ctx.id });
+                if (res.result?.value?.required) {
+                    const result = res.result.value;
+                    // どのターゲットで見つかったかを記録（clickApproval用）
+                    result.targetUrl = url;
+                    return result;
+                }
+            }
+        } catch (e) {
+            // logInteraction('ERROR', '[CHECK_APPROVAL] eval failed for ' + t.title + ': ' + e.message);
+        } finally {
+            if (tempCdp && tempCdp !== preferredCdp) {
+                try { tempCdp.ws.close(); } catch (e) { }
+            }
+        }
     }
     return null;
 }
 
-async function clickApproval(cdp, allow, targetLabel = null) {
+async function clickApproval(preferredCdp, allow, targetLabel = null, targetUrl = null) {
     const isAllowStr = allow ? 'true' : 'false';
     const safeLabel = targetLabel ? JSON.stringify(targetLabel.toLowerCase()) : 'null';
-    // メイン document から承認/拒否ボタンを探してクリック
-    // targetLabel が指定されている場合はそのラベルのボタンを優先
+
+    // 指定された targetUrl があれば優先、なければ preferredCdp を使う
+    let activeCdp = preferredCdp;
+    let needsClose = false;
+
+    if (targetUrl && (!preferredCdp || preferredCdp.ws.url !== targetUrl)) {
+        try {
+            activeCdp = await connectCDP(targetUrl);
+            needsClose = true;
+        } catch (e) {
+            logInteraction('ERROR', '[CLICK_APPROVAL] failed to connect to ' + targetUrl + ': ' + e.message);
+            if (!activeCdp) return { success: false };
+        }
+    }
+
+    if (!activeCdp) return { success: false };
+
     const EXP = `(() => {
         const SELECTORS = ${JSON.stringify(SELECTORS)};
         const isAllow = ${isAllowStr};
         const targetLabel = ${safeLabel};
 
+        function getAllInteractiveElements(root) {
+            let els = Array.from(root.querySelectorAll('button, [role="button"], a[role="button"]'));
+            const all = root.querySelectorAll('*');
+            for (const el of all) {
+                if (el.shadowRoot) {
+                    els = els.concat(getAllInteractiveElements(el.shadowRoot));
+                }
+            }
+            return els;
+        }
+
         function getButtonText(btn) {
             const span = btn.querySelector('span.truncate');
-            return span ? (span.textContent || '').trim().toLowerCase() : '';
+            if (span) return (span.textContent || '').trim().toLowerCase();
+            const raw = (btn.innerText || btn.textContent || '').trim();
+            return raw.split('\\n')[0].trim().toLowerCase();
         }
 
         function isApproveButton(text) {
-            return SELECTORS.APPROVAL_KEYWORDS.some(kw => text === kw || text.startsWith(kw + ' '));
+            if (!text) return false;
+            return SELECTORS.APPROVAL_KEYWORDS.some(kw => {
+                const lkw = kw.toLowerCase();
+                return text === lkw || text.startsWith(lkw + ' ') || text.includes(lkw);
+            });
         }
 
         function isRejectButton(text) {
-            return SELECTORS.CANCEL_KEYWORDS.some(kw => text === kw || text.startsWith(kw + ' '));
+            if (!text) return false;
+            return SELECTORS.CANCEL_KEYWORDS.some(kw => {
+                const lkw = kw.toLowerCase();
+                return text === lkw || text.startsWith(lkw + ' ') || text.includes(lkw);
+            });
         }
 
-        const buttons = Array.from(document.querySelectorAll('button'));
+        const buttons = getAllInteractiveElements(document.body || document);
         for (const btn of buttons) {
             if (btn.offsetWidth === 0 || btn.offsetHeight === 0) continue;
             if (btn.getAttribute('aria-haspopup') === 'listbox') continue;
@@ -1881,14 +1975,17 @@ async function clickApproval(cdp, allow, targetLabel = null) {
             const text = getButtonText(btn);
             if (!text) continue;
 
-            // Safe Click: 親コンテナ内に対となるボタンが存在するか検証
-            const container = btn.parentElement;
+            let container = btn.parentElement;
+            let siblings = [];
+            for (let level = 0; level < 4 && container; level++) {
+                siblings = getAllInteractiveElements(container)
+                    .filter(s => s.offsetWidth > 0 && s.offsetHeight > 0 && s.getAttribute('aria-haspopup') !== 'listbox');
+                if (siblings.length > 1) break;
+                container = container.parentElement;
+            }
             if (!container) continue;
-            const siblings = Array.from(container.querySelectorAll('button'))
-                .filter(s => s.offsetWidth > 0 && s.offsetHeight > 0 && s.getAttribute('aria-haspopup') !== 'listbox');
 
             if (isAllow && isApproveButton(text)) {
-                // targetLabel が指定されている場合はそのラベルのみクリック
                 if (targetLabel && text !== targetLabel) continue;
                 const hasReject = siblings.some(s => s !== btn && isRejectButton(getButtonText(s)));
                 if (!hasReject) continue;
@@ -1907,16 +2004,22 @@ async function clickApproval(cdp, allow, targetLabel = null) {
         return { success: false, log: [] };
     })()`;
 
-    for (const ctx of cdp.contexts) {
-        try {
-            const evalPromise = cdp.call("Runtime.evaluate", { expression: EXP, returnByValue: true, contextId: ctx.id });
-            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000));
-            const res = await Promise.race([evalPromise, timeoutPromise]);
-            if (res.result?.value?.success) {
-                logInteraction('CLICK', `Approval / Rejection clicked: ${allow} (success)`);
-                return res.result.value;
-            }
-        } catch (e) { }
+    try {
+        for (const ctx of activeCdp.contexts) {
+            try {
+                const evalPromise = activeCdp.call("Runtime.evaluate", { expression: EXP, returnByValue: true, contextId: ctx.id });
+                const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000));
+                const res = await Promise.race([evalPromise, timeoutPromise]);
+                if (res.result?.value?.success) {
+                    logInteraction('CLICK', `Approval / Rejection clicked: ${allow} (success) in ${activeCdp.ws.url}`);
+                    return res.result.value;
+                }
+            } catch (e) { }
+        }
+    } finally {
+        if (needsClose && activeCdp) {
+            try { activeCdp.ws.close(); } catch (e) { }
+        }
     }
     logInteraction('CLICK', `Approval / Rejection clicked: ${allow} (failed)`);
     return { success: false };
@@ -1998,16 +2101,31 @@ async function getLastResponse(cdp) {
                     }
                 }
 
-                // ユーザーの吹き出し（undoボタンがあるブロック内）も除去
-                var undos = Array.from(clone.querySelectorAll('[data-tooltip-id*="undo"], [title*="Undo"]'));
-                for (var ui = 0; ui < undos.length; ui++) {
-                    var bubble = undos[ui].closest('.whitespace-pre-wrap') || undos[ui].parentElement;
-                    if (bubble && bubble.parentNode) bubble.parentNode.replaceChild(document.createTextNode(' '), bubble);
-                }
-
-                // レイアウトを保持してテキスト取得
+                // レイアウトを保持するためDOMに追加（テキスト取得前）
                 clone.style.cssText = 'position:absolute;left:-9999px;top:0;opacity:0;pointer-events:none;width:800px';
                 document.body.appendChild(clone);
+
+                // ユーザーの吹き出し（undoボタンがあるブロック内）を除去
+                // DOM追加後にgetComputedStyleで背景色のある祖先を検出
+                var undos = Array.from(clone.querySelectorAll('[data-tooltip-id*="undo"], [title*="Undo"]'));
+                for (var ui = 0; ui < undos.length; ui++) {
+                    var cur = undos[ui];
+                    var target = cur.closest('.whitespace-pre-wrap') || cur.parentElement;
+                    // 背景色を持つ祖先を探す（ユーザーの吹き出し全体）
+                    var ancestor = cur.parentElement;
+                    while (ancestor && ancestor !== clone) {
+                        try {
+                            var bg = window.getComputedStyle(ancestor).backgroundColor;
+                            if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') {
+                                target = ancestor;
+                                break;
+                            }
+                        } catch (e) { }
+                        ancestor = ancestor.parentElement;
+                    }
+                    if (target && target.parentNode) target.parentNode.replaceChild(document.createTextNode(' '), target);
+                }
+
                 var text = clone.innerText;
                 document.body.removeChild(clone);
 
@@ -2646,6 +2764,9 @@ async function monitorAIResponse(originalMessage, cdp) {
 
             const approval = await checkApprovalRequired(cdp);
             if (approval) {
+                // targetUrl を保持
+                const targetUrl = approval.targetUrl;
+
                 // If we already sent THIS specific approval message, don't send it again
                 if (lastApprovalMessage === approval.message) {
                     setTimeout(poll, POLLING_INTERVAL);
@@ -2672,7 +2793,8 @@ async function monitorAIResponse(originalMessage, cdp) {
                         // 自動承認をスキップし、以降のDiscord通知フローに進む
                     } else {
                         // 安全なコマンド → 自動承認
-                        const autoApprovalResult = await clickApproval(cdp, true);
+                        // targetUrl を渡す
+                        const autoApprovalResult = await clickApproval(cdp, true, null, targetUrl);
                         if (autoApprovalResult?.success) {
                             logInteraction('APPROVAL', `Auto-approved request: ${approval.message.substring(0, 50)}...`);
                             lastApprovalMessage = null;
@@ -2717,10 +2839,18 @@ async function monitorAIResponse(originalMessage, cdp) {
                 const row = new ActionRowBuilder().addComponents(...allButtons);
                 logInteraction('APPROVAL', `Request sent to Discord: ${approval.message.substring(0, 50)}...`);
 
-                const reply = await originalMessage.reply({
-                    content: `**Action Required:**\n${approval.message}`,
-                    components: [row]
-                });
+                let reply;
+                try {
+                    reply = await originalMessage.reply({
+                        content: `**Action Required:**\n${approval.message}`,
+                        components: [row]
+                    });
+                } catch (replyErr) {
+                    console.error('[DISCORD_REPLY_ERROR]', replyErr.message);
+                    lastApprovalMessage = null; // リセットして再試行可能にする
+                    setTimeout(poll, POLLING_INTERVAL);
+                    return;
+                }
 
                 try {
                     const interaction = await reply.awaitMessageComponent({ filter: i => i.user.id === (originalMessage.author?.id || originalMessage.user?.id), time: 60000 });
@@ -2728,7 +2858,8 @@ async function monitorAIResponse(originalMessage, cdp) {
                     // クリックされたDiscordボタンのラベルを取得し、Antigravity側の対応ボタンをクリック
                     const clickedLabel = interaction.component.label;
                     await interaction.deferUpdate();
-                    const clickResult = await clickApproval(cdp, allow, clickedLabel);
+                    // targetUrl を渡す
+                    const clickResult = await clickApproval(cdp, allow, clickedLabel, targetUrl);
                     logInteraction('ACTION', `User clicked "${clickedLabel}" (${allow ? 'Approve' : 'Reject'}).`);
 
                     // Edit reply to show outcome
@@ -2839,14 +2970,6 @@ const commands = [
     {
         name: 'newchat',
         description: 'Start a new chat',
-        options: [
-            {
-                name: 'prompt',
-                description: 'Prompt to send after creating a new chat',
-                type: 3,
-                required: false,
-            }
-        ]
     },
     {
         name: 'title',
@@ -2862,26 +2985,26 @@ const commands = [
         description: 'List models or switch model',
         options: [
             {
-                name: 'number',
-                description: 'Model number to switch',
-                type: 4,
-                required: false,
+                name: 'target',
+                description: 'Type "list" to show models, or a number to switch',
+                type: 3, // STRING
+                required: true,
             }
         ]
     },
     {
-        name: 'mode',
-        description: 'Show or switch mode (planning/fast)',
+        name: 'conversation',
+        description: 'Switch conversation mode (planning/fast)',
         options: [
             {
-                name: 'target',
-                description: 'Target mode (planning or fast)',
-                type: 3,
-                required: false,
-                choices: [
-                    { name: 'Planning', value: 'planning' },
-                    { name: 'Fast', value: 'fast' }
-                ]
+                name: 'planning',
+                description: 'Switch to Planning mode',
+                type: 1, // SUB_COMMAND
+            },
+            {
+                name: 'fast',
+                description: 'Switch to Fast mode',
+                type: 1, // SUB_COMMAND
             }
         ]
     },
@@ -2890,14 +3013,14 @@ const commands = [
         description: 'Enable or disable auto-approval mode',
         options: [
             {
-                name: 'target',
-                description: 'Target state (on or off)',
-                type: 3,
-                required: false,
-                choices: [
-                    { name: 'On', value: 'on' },
-                    { name: 'Off', value: 'off' }
-                ]
+                name: 'on',
+                description: 'Enable auto-approval mode',
+                type: 1, // SUB_COMMAND
+            },
+            {
+                name: 'off',
+                description: 'Disable auto-approval mode',
+                type: 1, // SUB_COMMAND
             }
         ]
     },
@@ -3065,7 +3188,6 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (commandName === 'newchat') {
-            const prompt = interaction.options.getString('prompt');
             const result = await startNewChat(cdp);
             if (!result.success) {
                 const reason = result.reason || 'unknown';
@@ -3076,34 +3198,8 @@ client.on('interactionCreate', async interaction => {
             isGenerating = false;
             await new Promise(r => setTimeout(r, 3000));
 
-            if (prompt && prompt.trim()) {
-                const promptText = prompt.trim();
-                logInteraction('NEWCHAT', `Prompt provided (${promptText.length} chars). Sending after new chat.`);
-                let injected = await injectMessage(cdp, promptText);
-                let started = injected.ok ? await waitForGenerationStart(cdp, 9000) : false;
-
-                if (!started) {
-                    logInteraction('NEWCHAT', 'No generation detected after first send. Retrying once...');
-                    await new Promise(r => setTimeout(r, 1000));
-                    injected = await injectMessage(cdp, promptText);
-                    started = injected.ok ? await waitForGenerationStart(cdp, 9000) : false;
-                }
-
-                if (injected.ok && started) {
-                    await interaction.editReply(`New chat started and prompt was sent (${injected.method}).`);
-                    logInteraction('ACTION', 'Start monitor for /newchat prompt flow.');
-                    void monitorAIResponse(createInteractionReplyBridge(interaction, promptText), cdp);
-                } else if (injected.ok && !started) {
-                    logInteraction('ERROR', 'Prompt was injected, but generation did not start.');
-                    await interaction.editReply('Prompt was injected, but generation did not start. Check the Antigravity input box and press Enter once.');
-                } else {
-                    logInteraction('ERROR', `Prompt send failed after new chat: ${injected.error || 'unknown'}`);
-                    await interaction.editReply(`New chat started, but prompt send failed: ${injected.error || 'unknown'}`);
-                }
-            } else {
-                logInteraction('NEWCHAT', 'No prompt provided. New chat only.');
-                await interaction.editReply('New chat request completed.');
-            }
+            logInteraction('NEWCHAT', 'New chat request only.');
+            await interaction.editReply('New chat request completed.');
             return;
         }
 
@@ -3149,9 +3245,9 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (commandName === 'model') {
-            const num = interaction.options.getInteger('number');
+            const target = interaction.options.getString('target');
 
-            if (num === null) {
+            if (target.toLowerCase() === 'list') {
                 const current = await getCurrentModel(cdp);
                 const models = await getModelList(cdp);
                 if (models.length === 0) {
@@ -3159,12 +3255,13 @@ client.on('interactionCreate', async interaction => {
                     return;
                 }
                 const list = models.map((m, i) => `${m === current ? '>' : ' '} ${i + 1}. ${m}`).join('\n');
-                await interaction.editReply(`Current model: ${current || 'unknown'}\n\n${list}\n\nUse /model number:<n> to switch.`);
+                await interaction.editReply(`Current model: ${current || 'unknown'}\n\n${list}\n\nUse /model target:<n> to switch.`);
                 return;
             }
 
-            if (num < 1) {
-                await interaction.editReply('Number must be >= 1.');
+            const num = parseInt(target, 10);
+            if (isNaN(num) || num < 1) {
+                await interaction.editReply('Target must be "list" or a valid number >= 1.');
                 return;
             }
             const models = await getModelList(cdp);
@@ -3181,18 +3278,12 @@ client.on('interactionCreate', async interaction => {
             return;
         }
 
-        if (commandName === 'mode') {
-            const target = interaction.options.getString('target');
+        if (commandName === 'conversation') {
+            const subcommand = interaction.options.getSubcommand();
 
-            if (!target) {
-                const mode = await getCurrentMode(cdp);
-                await interaction.editReply(`Current mode: ${mode || 'unknown'}\n\nUse /mode target:<planning|fast> to switch.`);
-                return;
-            }
-
-            const result = await switchMode(cdp, target);
+            const result = await switchMode(cdp, subcommand);
             if (result.success) {
-                await interaction.editReply(`Switched mode to ${result.mode}.`);
+                await interaction.editReply(`Switched conversation mode to ${result.mode}.`);
             } else {
                 await interaction.editReply(`Failed to switch mode: ${result.reason}`);
             }
@@ -3200,15 +3291,15 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (commandName === 'auto') {
-            const target = interaction.options.getString('target');
+            const subcommand = interaction.options.getSubcommand();
 
-            if (!target) {
-                await interaction.editReply(`Auto-approval mode is currently **${autoApproveMode ? 'ON' : 'OFF'}**.`);
-                return;
+            if (subcommand === 'on') {
+                autoApproveMode = true;
+                await interaction.editReply('Auto-approval mode has been turned **ON**.');
+            } else if (subcommand === 'off') {
+                autoApproveMode = false;
+                await interaction.editReply('Auto-approval mode has been turned **OFF**.');
             }
-
-            autoApproveMode = (target === 'on');
-            await interaction.editReply(`Auto-approval mode has been turned **${autoApproveMode ? 'ON' : 'OFF'}**.`);
             return;
         }
 
@@ -3227,22 +3318,20 @@ client.on('interactionCreate', async interaction => {
 **/status**
 Check the current Antigravity mode (planning/fast) and whether auto-approval is ON or OFF.
 
-**/auto [target]**
+**/auto [on|off]**
 Manage auto-approval mode for \`Run\` and \`Allow Once\` actions.
-- \`/auto\` (no target): Shows current ON/OFF state.
-- \`/auto target:On\`: Enables auto-approval.
-- \`/auto target:Off\`: Disables auto-approval.
+- \`/auto on\`: Enables auto-approval.
+- \`/auto off\`: Disables auto-approval.
 
-**/model [num]**
+**/model [target]**
 Switch the AI model (e.g., GPT-4, Claude 3).
-- \`/model\`: Lists available models.
-- \`/model num:1\`: Selects model #1 from the list.
+- \`/model target:list\`: Lists available models.
+- \`/model target:1\`: Selects model #1 from the list.
 
-**/mode [target]**
+**/conversation [planning|fast]**
 Switch the agent's operating mode.
-- \`/mode\` (no target): Shows current mode.
-- \`/mode target:planning\`: Switches to Planning mode (waits for approval).
-- \`/mode target:fast\`: Switches to Fast mode (acts immediately).
+- \`/conversation planning\`: Switches to Planning mode (waits for approval).
+- \`/conversation fast\`: Switches to Fast mode (acts immediately).
 
 **/list_windows** & **/select_window [number]**
 Manage which VSCode/IDE window to connect to via CDP.
